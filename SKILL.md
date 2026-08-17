@@ -5,7 +5,9 @@ description: |
   Full workflow: Crawl → Fetch → Resolve → Annotate → Split → Consolidate → Refine → Generate → Verify
   
   Phase 1 (CLONE): Extract HTML/CSS/components from any website
-  Phase 2 (BUILD APP): Consolidate shared components, AI refine CSS→Tailwind, generate Next.js routes
+  Phase 2 (BUILD APP): Two modes —
+    - Mode Faithful  : Port nguyên HTML/CSS/JS sang Next.js (pixel-perfect 1:1)
+    - Mode Creative  : AI refine với ui-ux-pro-max knowledge + design tokens thật
 
   Use this skill whenever the user wants to clone, replicate, rebuild, reverse-engineer,
   or copy any website UI — AND convert it into a working Next.js app.
@@ -19,7 +21,23 @@ description: |
 You are a **website cloning agent** that reverse-engineers any website's UI into a **production-ready Next.js App Router project**. The pipeline has two phases:
 
 **Phase 1 (CLONE)**: Deterministic tools extract HTML, CSS, components from the website
-**Phase 2 (BUILD APP)**: AI consolidates shared components, refines CSS→Tailwind, generates Next.js routes
+**Phase 2 (BUILD APP)**: Choose 1 of 2 modes:
+
+- **Mode Faithful** (`--mode=faithful`) — Port nguyên HTML/CSS/JS sang Next.js. DOM 1:1, download ảnh + font thật, inject CSS gốc. Pixel-perfect fidelity, nhưng code không "đẹp".
+- **Mode Creative** (`--mode=creative`, default) — AI refine component skeleton sang Next.js + Tailwind v4 + shadcn/ui đẹp, dùng đúng design tokens từ Phase 1 + ui-ux-pro-max aesthetic knowledge.
+
+## When to use which mode?
+
+| Tình huống | Mode |
+|------------|------|
+| User yêu cầu "clone y bản gốc" / "pixel-perfect" / "1:1" | **Faithful** |
+| Cần giữ nguyên mọi animation, Canvas, WebGL, Framer effects | **Faithful** |
+| Cần giữ font thương hiệu riêng (vd newSpiritCondensed, custom woff2) | **Faithful** |
+| Cần build nhanh (chạy scripts, không cần AI) | **Faithful** |
+| User yêu cầu "build app" / "tái sáng tác" / "production-ready" | **Creative** |
+| Cần code sạch, maintainable, dùng shadcn/Tailwind idioms | **Creative** |
+| Cần customize thêm sections mới, không có trong site gốc | **Creative** |
+| Accessibility quan trọng (cần fix issues của site gốc) | **Creative** |
 
 ## Why This Hybrid Approach Works
 
@@ -52,16 +70,28 @@ URL
  ║  PHASE 2: BUILD APP — Create Next.js project           ║
  ╠════════════════════════════════════════════════════════╣
  ║                                                        ║
- ║  Step A: CONSOLIDATE ── Merge shared components         ║
- ║          (Header, Footer across all pages → 1 version)  ║
- ║  Step B: REFINE ─────── AI: CSS→Tailwind + React state ║
- ║  Step C: GENERATE ───── Next.js App Router structure    ║
- ║          (layout.tsx, page.tsx, dynamic [slug] routes)  ║
- ║  Step D: COPY ASSETS ── Screenshots + design tokens     ║
+ ║  Pick a mode:                                          ║
+ ║                                                        ║
+ ║  ┌─ Mode Faithful (--mode=faithful) ──────────────┐    ║
+ ║  │  2.1 Port HTML → JSX                            │    ║
+ ║  │  2.2 Download assets (images, media)            │    ║
+ ║  │  2.3 Download fonts (@font-face)                │    ║
+ ║  │  2.4 Rewrite asset URLs in JSX                  │    ║
+ ║  │  2.5 Inject resolved.css → globals.css          │    ║
+ ║  └────────────────────────────────────────────────┘    ║
+ ║                                                        ║
+ ║  ┌─ Mode Creative (--mode=creative, default) ─────┐    ║
+ ║  │  2.1 Build 3-layer W3C DTCG tokens.json         │    ║
+ ║  │  2.2 Generate CSS + Tailwind config             │    ║
+ ║  │  2.3 Map into globals.css (@theme inline)       │    ║
+ ║  │  2.4 Generate MASTER.md (style/motion/density)  │    ║
+ ║  │  2.5 Refine components (per refine-with-style)  │    ║
+ ║  │  2.6 Validate tokens (no hardcoded hex/px)      │    ║
+ ║  └────────────────────────────────────────────────┘    ║
  ║                                                        ║
  ╚════════════════════════════════════════════════════════╝
  │
- └─ Step 5: VERIFY ─────── VLM comparison ──→ Visual QA
+ └─ Step 5: VERIFY ─────── VLM + design-audit.mjs ──→ Visual + heuristic QA
 ```
 
 ## Prerequisites (Already Installed)
@@ -279,6 +309,123 @@ The cheerio splitter produces `.tsx` files with **DOM-accurate** React component
 
 ---
 
+# PHASE 2 — BUILD APP
+
+## Choose your mode
+
+| Mode | Flag | Fidelity | Speed | Code Quality | When |
+|------|------|----------|-------|--------------|------|
+| **Faithful** | `--mode=faithful` | 9-10/10 (1:1) | Fast (~30s/page) | Medium (raw HTML, dangerouslySetInnerHTML) | "clone y bản gốc" / pixel-perfect |
+| **Creative** | `--mode=creative` (default) | 6-8/10 | Slow (2-5 min/component) | High (Tailwind v4, shadcn, TS) | "build app" / production-ready |
+
+See `references/mode-faithful-guide.md` and `references/mode-creative-guide.md` for full guides.
+
+---
+
+## Mode Faithful — Pixel-Perfect Port
+
+**Goal**: Port nguyên HTML/CSS/JS sang Next.js, giữ DOM 1:1.
+
+**Scripts** (all in `skills/clone-website/scripts/phase2-faithful/`):
+
+| Script | Bước | Mục đích |
+|--------|------|---------|
+| `port-html-to-jsx.js` | 2.1 | HTML → JSX (class→className, attr camelCase, SVG dashed→camelCase, boolean attrs preserved, `<script>`/`<style>` attrs kept) |
+| `download-assets.js` | 2.2 | Tải ảnh/media remote về `public/assets/{page}/` (SSRF-safe, srcset parsed, --allow-private flag) |
+| `download-fonts.js` | 2.3 | Parse `@font-face` từ CSS files → download woff2 only (+ fallback chain), emit `fonts-manifest.json` |
+| `rewrite-asset-urls.js` | 2.4 | Replace remote URLs bằng local paths (dùng asset manifest + font manifest) |
+| `inject-resolved-css.js` | 2.5 | Inject `resolved.css` + `extracted.css` vào globals.css, scope bằng `:where([data-page="..."])` (preserves @font-face/@keyframes verbatim) |
+| `batch-faithful.js` | All | Orchestrator — chạy 5 bước trên (proper arg quoting, scans whole page dir for assets) |
+
+**Quick run**:
+```bash
+# Single page
+node skills/clone-website/scripts/phase2-faithful/batch-faithful.js \
+  clone-output/pages/home --src src --public public --page home
+
+# All pages
+node skills/clone-website/scripts/phase2-faithful/batch-faithful.js \
+  clone-output/pages --src src --public public --all
+
+# For localhost / intranet clones (SSRF-safe with --allow-private)
+node skills/clone-website/scripts/phase2-faithful/batch-faithful.js \
+  clone-output/pages/home --src src --public public --page home --allow-private
+```
+
+**Security**: By default, `download-assets.js` and `download-fonts.js` block requests to private/loopback IPs (127.0.0.1, 10.x, 192.168.x, 169.254.169.254, etc.) to prevent SSRF. Pass `--allow-private` to override (e.g. when cloning a localhost dev server). Use `--allow-host <hostname>` to allowlist specific hostnames.
+
+**Wiring vào Next.js**:
+```tsx
+// src/app/home/page.tsx
+import PageFaithful from '@/components/pages/home/PageFaithful';
+
+export default function Page() {
+  return (
+    <main data-page="home">
+      <PageFaithful />
+    </main>
+  );
+}
+```
+
+The `data-page="home"` attribute enables `:where([data-page="home"])` CSS scope (0 specificity, so Tailwind utilities still win when needed).
+
+---
+
+## Mode Creative — Refine with Style
+
+**Goal**: AI tái sáng tác component skeleton thành Next.js + Tailwind v4 + shadcn/ui ĐẸP, dùng đúng design tokens từ Phase 1 + ui-ux-pro-max aesthetic knowledge.
+
+**Pipeline**:
+1. **Build tokens.json** (3-layer W3C DTCG: primitive → semantic → component) từ `design-tokens.json` của Phase 1
+2. **Generate CSS + Tailwind config** qua `generate-tokens.cjs`
+3. **Map vào `globals.css`** với `@theme inline` + `:root` + `.dark` blocks (shadcn CLI v4 convention, HSL space-separated for opacity modifier)
+4. **Generate MASTER.md** qua `python3 search.py "<brief>" --design-system --persist --output-dir design-system/<slug>` (style + motion tier + density decisions)
+5. **Refine từng component** theo `templates/refine-with-style.md` prompt (đầu vào: skeleton + tokens + screenshot + MASTER.md → đầu ra: Next.js component đẹp)
+6. **Validate tokens** qua `validate-tokens.cjs --dir src/` (no hardcoded hex/px/rem)
+7. **Run design-audit.mjs** để check heuristic (overflow, alt, focus, contrast, tap target, viewport meta, html lang, headings) trên 6 viewports
+8. **VLM-compare** với screenshot gốc → fidelity ≥7/10
+
+**Prompt template**: `templates/refine-with-style.md` (5 steps: Load context → Map tokens → Refactor skeleton → Motion presets → Self-audit, with full anti-patterns list).
+
+**Knowledge sources** (đã copy từ `ui-ux-pro-max-skill`):
+- `references/ui-ux-pro-max/` — 10-category UX rules + pre-delivery checklist
+- `references/ui-styling/` — shadcn theming + components + accessibility + Tailwind utilities/customization/responsive
+- `references/design-system/` — 3-layer token architecture (primitive/semantic/component) + Tailwind integration + states-and-variants + component-specs
+- `references/brand/` — color palette management + typography specifications + visual identity + consistency checklist
+- `data/ui-ux-pro-max/` — 88 styles, 17 GSAP presets × 3 tiers, 74 font pairings, 192 product palettes, 35 landing patterns, 119 UX guidelines, 22 stacks (1260 rules), 1934 Google Fonts, 105 icons, 25 chart types
+
+**Quick run**:
+```bash
+# Generate MASTER.md (style decisions)
+python3 skills/clone-website/scripts/phase2-creative/search.py \
+  "AI business builder for SaaS, marketing site" \
+  --design-system \
+  --persist \
+  --output-dir design-system/durable \
+  --variance 5 --motion 4 --density 5 \
+  --stack nextjs
+
+# Build 3-layer tokens (manual or via sync-brand-to-tokens.cjs)
+node skills/clone-website/scripts/phase2-creative/sync-brand-to-tokens.cjs \
+  --brand-file docs/brand-guidelines.md --dry-run
+
+# Generate CSS variables
+node skills/clone-website/scripts/phase2-creative/generate-tokens.cjs \
+  --config tokens.json -o src/app/design-tokens.css
+
+# (Refine components using templates/refine-with-style.md prompt)
+
+# Audit
+node skills/clone-website/scripts/phase2-creative/design-audit.mjs \
+  --url http://localhost:3000/home --out audit-output/home
+
+# Validate token compliance
+node skills/clone-website/scripts/phase2-creative/validate-tokens.cjs --dir src/
+```
+
+---
+
 ## Step 4: AI Refine (LLM — Tailwind + Logic + Next.js)
 
 **Tool:** LLM (z-ai)
@@ -380,6 +527,8 @@ z-ai vision -p "Compare these two screenshots. The FIRST is the original website
 
 ## Quick Reference Commands
 
+### Phase 1 (CLONE) — dùng chung cho cả 2 mode
+
 ```bash
 # Step 0: Crawl (discover all pages)
 node skills/clone-website/scripts/crawl-pages.js "TARGET_URL" 1 clone-output
@@ -400,8 +549,94 @@ node skills/clone-website/scripts/split-components.js clone-output/html-annotate
 # Step 3b: Split CSS by component
 node skills/clone-website/scripts/split-css-by-component.js clone-output/html-raw/extracted.css clone-output/components-raw clone-output/components-css
 
-# Step 4: Refine (AI — done interactively via this skill)
-# Step 5: Verify (VLM — done interactively via this skill)
+# Batch all steps for multiple pages:
+node skills/clone-website/scripts/batch-pipeline.js "TARGET_URL" clone-output
+```
+
+### Phase 2 — Mode Faithful (pixel-perfect 1:1 port)
+
+```bash
+# Run all 5 steps for one page
+node skills/clone-website/scripts/phase2-faithful/batch-faithful.js \
+  clone-output/pages/home --src src --public public --page home
+
+# Or all pages
+node skills/clone-website/scripts/phase2-faithful/batch-faithful.js \
+  clone-output/pages --src src --public public --all
+
+# Individual steps:
+node skills/clone-website/scripts/phase2-faithful/port-html-to-jsx.js \
+  clone-output/pages/home/html-annotated/page.sanitized.html \
+  src/components/pages/home/PageFaithful.tsx --name PageFaithful --page home
+
+node skills/clone-website/scripts/phase2-faithful/download-assets.js \
+  clone-output/pages/home/html-annotated/page.sanitized.html \
+  --out public/assets/home --page home
+
+node skills/clone-website/scripts/phase2-faithful/download-fonts.js \
+  clone-output/pages/home/html-raw/extracted.css \
+  --out public/assets/fonts --page home
+
+node skills/clone-website/scripts/phase2-faithful/rewrite-asset-urls.js \
+  src/components/pages/home \
+  --manifest public/assets/home/home-assets-manifest.json
+
+node skills/clone-website/scripts/phase2-faithful/inject-resolved-css.js \
+  clone-output/pages/home/html-raw/resolved.css \
+  --extracted clone-output/pages/home/html-raw/extracted.css \
+  --globals src/app/globals.css \
+  --page home
+```
+
+### Phase 2 — Mode Creative (AI refine with ui-ux-pro-max knowledge)
+
+```bash
+# Generate MASTER.md (style/motion/density decisions)
+python3 skills/clone-website/scripts/phase2-creative/search.py \
+  "AI business builder for SaaS, marketing site" \
+  --design-system \
+  --persist \
+  --output-dir design-system/durable \
+  --variance 5 --motion 4 --density 5 \
+  --stack nextjs
+
+# Build 3-layer tokens from brand-guidelines.md
+node skills/clone-website/scripts/phase2-creative/sync-brand-to-tokens.cjs \
+  --brand-file docs/brand-guidelines.md --dry-run  # preview
+
+# Generate CSS variables + Tailwind config
+node skills/clone-website/scripts/phase2-creative/generate-tokens.cjs \
+  --config tokens.json -o src/app/design-tokens.css
+
+node skills/clone-website/scripts/phase2-creative/generate-tokens.cjs \
+  --config tokens.json -f tailwind > tailwind-colors.js
+
+# (Refine components using templates/refine-with-style.md prompt with AI)
+
+# Validate token compliance (no hardcoded hex/px/rem)
+node skills/clone-website/scripts/phase2-creative/validate-tokens.cjs --dir src/
+
+# Audit on 6 viewports (mobile-360, mobile-390, tablet-768, laptop-1024, desktop-1440, wide-1920)
+node skills/clone-website/scripts/phase2-creative/design-audit.mjs \
+  --url http://localhost:3000/home --out audit-output/home
+
+# Search the ui-ux-pro-max knowledge base
+python3 skills/clone-website/scripts/phase2-creative/search.py "SaaS landing hero" --domain landing
+python3 skills/clone-website/scripts/phase2-creative/search.py "modern startup font pairing" --domain typography
+python3 skills/clone-website/scripts/phase2-creative/search.py "error summary validation" --domain ux
+```
+
+### Step 5: Verify (both modes)
+
+```bash
+# Visual fidelity check (VLM)
+z-ai vision -p "Compare these two screenshots. List ALL visual differences. Rate overall fidelity 1-10." \
+  -i clone-output/pages/home/qa/screenshot-original-desktop.png \
+  -i audit-output/home/screenshots/desktop-1440.png
+
+# Or use design-audit.mjs (mode-creative only, gives heuristic report)
+node skills/clone-website/scripts/phase2-creative/design-audit.mjs \
+  --url http://localhost:3000/home --out audit-output/home
 ```
 
 ## When to Use This Skill
@@ -426,6 +661,8 @@ node skills/clone-website/scripts/split-css-by-component.js clone-output/html-ra
 
 ## What NOT to Do
 
+### Common (both modes)
+
 - **Don't skip Step 3 (CLI Split)** — This is the whole point of the hybrid approach. Without it, AI just guesses the structure.
 - **Don't use AI for structure** — AI should only refine AFTER the skeleton is built by the deterministic tool.
 - **Don't skip asset downloading** — Without real images/fonts, the clone looks fake.
@@ -433,3 +670,42 @@ node skills/clone-website/scripts/split-css-by-component.js clone-output/html-ra
 - **Don't approximate CSS** — Extract exact computed values, not "it looks like text-lg".
 - **Don't build click-based UI when original is scroll-driven** — Test scrolling before clicking to determine interaction model.
 - **Don't truncate component HTML** — Product prices, deep content, and nested styles get lost. Keep full content for Step 4.
+
+### Mode Faithful specific
+
+- **Don't convert class names** — Keep `bg-black/3`, `text-black/80`, `rounded-3xl`, `has-[:focus]` etc. as-is. Only convert syntax HTML → JSX (`class` → `className`, `for` → `htmlFor`, etc.).
+- **Don't remove `<script>` or `<style>` tags** — Preserve them via `dangerouslySetInnerHTML` (port-html-to-jsx does this automatically).
+- **Don't replace raw `<button>`, `<input>`, `<dialog>` with shadcn primitives** — Mode Faithful keeps the original DOM. Use shadcn only in Mode Creative.
+- **Don't skip the `data-page` attribute** — Without it, the `:where([data-page="..."])` CSS scope won't apply, and styles will leak between pages.
+- **Don't use `!important`** — Use Tailwind v4 `!` modifier (`bg-white!`) instead, which is more idiomatic.
+
+### Mode Creative specific
+
+- **Don't hardcode hex colors** (`text-[#00B67A]`) — Use `text-primary` or `bg-primary` semantic tokens.
+- **Don't mix hex + token** (`bg-white text-primary`) — Use `bg-background text-foreground` + `text-primary` for accent.
+- **Don't use `bg-blue-500`** (default Tailwind palette) when brand has its own palette — Use `bg-primary` (mapped via `@theme inline`).
+- **Don't hardcode spacing** (`p-[17px]`, `gap-[18px]`) — Use Tailwind scale (`p-4`, `gap-4`).
+- **Don't use desktop-first responsive** (`text-xl max-md:text-base`) — Use mobile-first (`text-base md:text-xl`).
+- **Don't use `flex-shrink-0`** (deprecated) — Use `shrink-0`.
+- **Don't use `h-6 w-6`** for square — Use `size-6`.
+- **Don't use dynamic class names** (`` `bg-${color}-500` ``) — Tailwind v4 can't static-detect → use `colorMap[color]` pattern with complete tokens.
+- **Don't use `'use client'` on entire page** — Push to leaf components. Server Component is default.
+- **Don't use `<img>`** instead of `<Image>` — CLS risk + no auto-optimization.
+- **Don't use `<a href="/internal">`** — Use `<Link>` for client-side nav + prefetch.
+- **Don't use placeholder as label** — Use `<FieldLabel htmlFor="...">`.
+- **Don't use inline styles** (except dynamic `animationDelay` per-item, custom CSS variables via `style={{ '--foo': 'bar' }}`).
+- **Don't mix flat & skeuomorphic styles randomly** — Pick 1 style from MASTER.md.
+- **Don't use emoji as icons** — Use Lucide (`import { X } from "lucide-react"`).
+- **Don't use `bg-gradient-to-r`** (Tailwind v3 syntax) — Use `bg-linear-to-r` (v4).
+- **Don't animate width/height/top/left** — Use transform/opacity only.
+- **Don't use one duration for every transition** — Use semantic durations (fast 150ms, normal 200ms, slow 300ms).
+- **Don't skip `prefers-reduced-motion` fallback** — `motion-reduce:transition-none`.
+- **Don't use `focus:ring-2`** (shows on click) — Use `focus-visible:ring-2`.
+- **Don't use touch targets < 44×44px** on mobile — `min-h-11 min-w-11`.
+- **Don't skip `aria-label`** on icon-only buttons.
+- **Don't skip `alt`** on `<Image>` (use `alt=""` for decorative).
+- **Don't skip heading levels** (h1 → h3) — Sequential h1→h2→h3.
+- **Don't have more than 1 `<h1>`** per page.
+- **Don't skip `<meta name="viewport">`** — Mobile rendering breaks.
+- **Don't skip `lang` attribute** on `<html>`.
+- **Don't rely on color alone for meaning** — Add icon + text.
