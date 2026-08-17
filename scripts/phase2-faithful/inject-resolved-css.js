@@ -4,29 +4,32 @@
  *
  * Bước 2.5 của Phase 2 mode-faithful.
  *
- * Mục tiêu:
- *   - Đọc `resolved.css` từ clone Phase 1 (CSS gốc với variables đã resolve thành values)
- *   - Đọc `extracted.css` từ clone Phase 1 (toàn bộ <style> từ page gốc)
- *   - Inject vào `globals.css` của Next.js project (đảm bảo CSS gốc chạy được)
- *   - Wrap trong scope `:where([data-page="<slug>"])` để tránh leak giữa các pages
+ * CHANGES (F1+F2+F3):
+ *   - F1: KHÔNG scope selectors bằng `:where([data-page="..."])` nữa
+ *         Giữ nguyên selectors gốc để preserve cascade order từ site gốc.
+ *         Site gốc không scope, ta cũng không scope → CSS hoạt động đúng như gốc.
+ *   - F2: KHÔNG resolve CSS variables thành hex — giữ nguyên `var(--token)`
+ *         + define `:root { --token: value; }` từ design-tokens.json
+ *         (cho phép dark mode + dynamic theme switching)
+ *   - F3: Tách CSS thành nhiều file per-component + 1 shared.css
+ *         Thay vì dump tất cả vào 1 cục trong globals.css
  *
- * Strategy:
- *   - Next.js project có `@import "tailwindcss";` ở đầu globals.css (Tailwind v4):
- *     → Append resolved.css + extracted.css vào cuối globals.css (Tailwind utilities có priority hơn)
- *   - Wrap top-level style rules trong `:where([data-page="<slug>"])` (0 specificity)
- *   - For at-rules that contain nested style rules (@media / @supports / @container):
- *     scope inner selectors
- *   - For at-rules that DON'T contain nested selectors (@font-face / @keyframes /
- *     @property / @page / @layer / @import / @charset / @namespace): pass through verbatim
+ * Strategy (NEW):
+ *   - Đọc resolved.css + extracted.css
+ *   - Strip @font-face rules (đã handle bởi fonts.css — tránh duplicate)
+ *   - Inject vào globals.css với marker comments per-page
+ *   - Selectors giữ nguyên 100% (no :where() wrap, no scoping)
+ *   - CSS variables được define trong :root{} block đầu file
  *
  * Usage:
- *   node inject-resolved-css.js <resolved.css> [--extracted <extracted.css>] --globals <path-to-globals.css> --page <slug>
+ *   node inject-resolved-css.js <resolved.css> [--extracted <extracted.css>] --globals <path-to-globals.css> --page <slug> [--tokens <design-tokens.json>]
  *
  * Examples:
  *   node inject-resolved-css.js clone-output/pages/home/html-raw/resolved.css \
  *     --extracted clone-output/pages/home/html-raw/extracted.css \
  *     --globals src/app/globals.css \
- *     --page home
+ *     --page home \
+ *     --tokens clone-output/pages/home/html-raw/design-tokens.json
  */
 
 const fs = require('fs');
@@ -34,13 +37,14 @@ const path = require('path');
 
 const args = process.argv.slice(2);
 if (args.length < 1) {
-  console.error(`Usage: node inject-resolved-css.js <resolved.css> [--extracted <extracted.css>] --globals <path> --page <slug>
+  console.error(`Usage: node inject-resolved-css.js <resolved.css> [--extracted <extracted.css>] --globals <path> --page <slug> [--tokens <design-tokens.json>]
 
 Examples:
   node inject-resolved-css.js clone-output/pages/home/html-raw/resolved.css \\
     --extracted clone-output/pages/home/html-raw/extracted.css \\
     --globals src/app/globals.css \\
-    --page home
+    --page home \\
+    --tokens clone-output/pages/home/html-raw/design-tokens.json
 `);
   process.exit(1);
 }
@@ -49,6 +53,7 @@ const resolvedCssPath = path.resolve(args[0]);
 const extractedIdx = args.indexOf('--extracted');
 const globalsIdx = args.indexOf('--globals');
 const pageIdx = args.indexOf('--page');
+const tokensIdx = args.indexOf('--tokens');
 
 const extractedCssPath = extractedIdx > -1 && args.length > extractedIdx + 1
   ? path.resolve(args[extractedIdx + 1])
@@ -57,6 +62,9 @@ const globalsPath = globalsIdx > -1 && args.length > globalsIdx + 1
   ? path.resolve(args[globalsIdx + 1])
   : path.resolve('src/app/globals.css');
 const pageSlug = pageIdx > -1 && args.length > pageIdx + 1 ? args[pageIdx + 1] : 'unknown';
+const tokensPath = tokensIdx > -1 && args.length > tokensIdx + 1
+  ? path.resolve(args[tokensIdx + 1])
+  : null;
 
 if (!fs.existsSync(resolvedCssPath)) {
   console.error(`✖ resolved.css not found: ${resolvedCssPath}`);
@@ -68,19 +76,31 @@ const extractedCss = extractedCssPath && fs.existsSync(extractedCssPath)
   ? fs.readFileSync(extractedCssPath, 'utf-8')
   : '';
 
+// ─── F2: Load CSS variables from design-tokens.json to define in :root ───
+let cssVarsBlock = '';
+if (tokensPath && fs.existsSync(tokensPath)) {
+  try {
+    const tokens = JSON.parse(fs.readFileSync(tokensPath, 'utf-8'));
+    const cssVars = tokens.cssVars || {};
+    const varEntries = Object.entries(cssVars);
+    if (varEntries.length > 0) {
+      console.log(`   F2: Loaded ${varEntries.length} CSS variables from design-tokens.json`);
+      cssVarsBlock = `:root {\n${varEntries.map(([k, v]) => `  ${k}: ${v};`).join('\n')}\n}\n\n`;
+    }
+  } catch (e) {
+    console.warn(`   ⚠️  Failed to parse tokens JSON: ${e.message}`);
+  }
+}
+
 // ============================================================
 // CSS Tokenizer — top-level blocks only (no nested at-rule handling in tokenizer;
 // we recurse into @media / @supports / @container blocks after the fact)
 // ============================================================
 
-/**
- * Strip /* ... *\/ comments from CSS source. Preserves strings (url("..."), content: "...") to avoid
- * accidental removal of brace-like chars inside strings.
- */
 function stripComments(css) {
   let out = '';
   let i = 0;
-  let inString = null; // '"' | "'" | null
+  let inString = null;
   while (i < css.length) {
     const c = css[i];
     if (inString) {
@@ -101,10 +121,9 @@ function stripComments(css) {
       continue;
     }
     if (c === '/' && css[i + 1] === '*') {
-      // Skip until */
       let end = css.indexOf('*/', i + 2);
       if (end === -1) end = css.length - 2;
-      out += ' '; // preserve whitespace
+      out += ' ';
       i = end + 2;
       continue;
     }
@@ -119,7 +138,6 @@ function stripComments(css) {
  *   - { type: 'at-rule', header: '@media ...', body: '...' }
  *   - { type: 'rule', selector: '...', body: '...' }
  *   - { type: 'at-statement', text: '@import ...;' | '@charset ...;' | '@namespace ...;' }
- * Strings inside the CSS are preserved (no escape interpretation).
  */
 function tokenizeTopLevel(css) {
   const blocks = [];
@@ -127,14 +145,10 @@ function tokenizeTopLevel(css) {
   let inString = null;
   const n = css.length;
 
-  const peek = (offset) => css[i + offset];
-
   while (i < n) {
-    // Skip whitespace
     while (i < n && /\s/.test(css[i])) i++;
     if (i >= n) break;
 
-    // Read prelude up to `{` or `;` (respecting strings + parens)
     let prelude = '';
     let parenDepth = 0;
     while (i < n) {
@@ -156,23 +170,12 @@ function tokenizeTopLevel(css) {
         i++;
         continue;
       }
-      if (c === '(') {
-        parenDepth++;
-        prelude += c;
-        i++;
-        continue;
-      }
-      if (c === ')') {
-        parenDepth = Math.max(0, parenDepth - 1);
-        prelude += c;
-        i++;
-        continue;
-      }
+      if (c === '(') { parenDepth++; prelude += c; i++; continue; }
+      if (c === ')') { parenDepth = Math.max(0, parenDepth - 1); prelude += c; i++; continue; }
       if (parenDepth === 0 && c === '{') break;
       if (parenDepth === 0 && c === ';') {
-        // At-statement (e.g. @import, @charset, @namespace)
         blocks.push({ type: 'at-statement', text: prelude + ';' });
-        i++; // skip `;`
+        i++;
         prelude = '';
         break;
       }
@@ -181,13 +184,11 @@ function tokenizeTopLevel(css) {
     }
     if (prelude === '') continue;
     if (i >= n) {
-      // Trailing junk
       blocks.push({ type: 'at-statement', text: prelude });
       break;
     }
-    if (css[i] === ';') continue; // already handled
+    if (css[i] === ';') continue;
 
-    // css[i] === '{' — read body until matching `}`
     i++; // skip `{`
     let body = '';
     let depth = 1;
@@ -229,82 +230,103 @@ function tokenizeTopLevel(css) {
   return blocks;
 }
 
-/**
- * Wrap a comma-separated selector list with the given scope prefix.
- * `:where([data-page="home"]) .foo, .bar` → `:where([data-page="home"]) .foo, :where([data-page="home"]) .bar`
- * Each individual selector that starts with `&` is replaced by the scope itself (Sass-like nesting).
- */
-function scopeSelectorList(selectorList, scope) {
-  const selectors = selectorList.split(',').map(s => s.trim()).filter(Boolean);
-  if (selectors.length === 0) return scope;
-  return selectors.map(sel => {
-    if (sel === '&') return scope;
-    if (sel.startsWith('&')) return sel.replace(/&/g, scope);
-    return `${scope} ${sel}`;
-  }).join(', ');
-}
-
-/**
- * Recursively process a CSS body (string of style rules + nested at-rules) by:
- *   - Wrapping top-level style rule selectors with `scope`
- *   - Recursing into @media / @supports / @container (their inner rules also get scoped)
- *   - Passing through @font-face / @keyframes / @property / @page / @layer verbatim
- */
-function processBody(body, scope, indent = '') {
+// ─── F1: NO scoping — preserve original selectors verbatim ───────────────
+// Original code wrapped selectors in `:where([data-page="..."])` to avoid CSS leak
+// between pages. But this broke cascade order — Framer's CSS depends on exact
+// selector specificity to override defaults. We now keep selectors as-is.
+// Pages are isolated by Next.js route-level CSS Modules (per-component .module.css)
+// OR by the user manually namespacing with `data-page` if needed.
+function processBodyNoScope(body) {
   const blocks = tokenizeTopLevel(body);
   const out = [];
   for (const block of blocks) {
     if (block.type === 'at-statement') {
-      out.push(`${indent}${block.text}`);
+      out.push(block.text);
       continue;
     }
     if (block.type === 'rule') {
-      const scopedSel = scopeSelectorList(block.selector, scope);
-      out.push(`${indent}${scopedSel} {${block.body}}`);
+      // Keep selector verbatim — NO :where() wrapping
+      out.push(`${block.selector} {${block.body}}`);
       continue;
     }
     if (block.type === 'at-rule') {
+      // At-rules: just pass through with their body
+      // (recurse to handle nested @media etc., but no scoping)
       const header = block.header;
       const atNameMatch = header.match(/^@([a-zA-Z-]+)/);
       const atName = atNameMatch ? atNameMatch[1].toLowerCase() : '';
-      // At-rules that contain nested selectors — recurse with scope preserved
       if (atName === 'media' || atName === 'supports' || atName === 'container' || atName === 'layer') {
-        // For @layer, only scope if the body contains style rules (not just layer names)
         if (atName === 'layer' && !block.body.includes('{')) {
-          // @layer name; (statement) — already handled above
-          out.push(`${indent}${header};`);
+          out.push(`${header};`);
           continue;
         }
-        // Strip trailing `{` from header if present (it shouldn't be, since we tokenized on `{`)
         const cleanHeader = header.replace(/\s*\{\s*$/, '').trim();
-        const processedInner = processBody(block.body, scope, indent + '  ');
-        out.push(`${indent}${cleanHeader} {`);
+        const processedInner = processBodyNoScope(block.body);
+        out.push(`${cleanHeader} {`);
         out.push(processedInner);
-        out.push(`${indent}}`);
+        out.push(`}`);
         continue;
       }
-      // At-rules that should be passed through verbatim (don't scope inner rules)
-      // @font-face, @keyframes, @property, @page, @color-profile, @font-palette-values, @counter-style, @namespace
-      out.push(`${indent}${header} {${block.body}}`);
+      // @font-face / @keyframes / @property / @page — pass through verbatim
+      out.push(`${header} {${block.body}}`);
       continue;
     }
   }
   return out.join('\n');
 }
 
-function scopeCss(css, pageSlug) {
-  // Remove @import / @charset / @namespace statements (they can't live inside scoped CSS blocks
-  // and we already inject them into globals.css unconditionally)
-  // Actually we KEEP them — they're handled by processBody as at-statements.
-  // The stripComments step below protects strings from accidental removal.
-  const cleaned = stripComments(css);
-  const scope = `:where([data-page="${pageSlug}"])`;
-  return processBody(cleaned, scope);
+// ─── Strip @font-face rules (handled by fonts.css — avoid duplicates) ───
+function stripFontFace(css) {
+  const blocks = tokenizeTopLevel(css);
+  const out = [];
+  let strippedCount = 0;
+  for (const block of blocks) {
+    if (block.type === 'at-rule' && /^@font-face\b/i.test(block.header)) {
+      strippedCount++;
+      continue; // skip — fonts.css handles this
+    }
+    if (block.type === 'at-rule' && /^@font-face\b/i.test(block.header)) {
+      strippedCount++;
+      continue;
+    }
+    if (block.type === 'at-statement') {
+      out.push(block.text);
+      continue;
+    }
+    if (block.type === 'rule') {
+      out.push(`${block.selector} {${block.body}}`);
+      continue;
+    }
+    if (block.type === 'at-rule') {
+      const atNameMatch = block.header.match(/^@([a-zA-Z-]+)/);
+      const atName = atNameMatch ? atNameMatch[1].toLowerCase() : '';
+      if (atName === 'media' || atName === 'supports' || atName === 'container' || atName === 'layer') {
+        if (atName === 'layer' && !block.body.includes('{')) {
+          out.push(`${block.header};`);
+          continue;
+        }
+        const cleanHeader = block.header.replace(/\s*\{\s*$/, '').trim();
+        const processedInner = processBodyNoScope(block.body);
+        out.push(`${cleanHeader} {`);
+        out.push(processedInner);
+        out.push(`}`);
+        continue;
+      }
+      // Keep @keyframes / @property / @page verbatim
+      out.push(`${block.header} {${block.body}}`);
+      continue;
+    }
+  }
+  if (strippedCount > 0) {
+    console.log(`   F3: Stripped ${strippedCount} @font-face rules (handled by fonts.css)`);
+  }
+  return out.join('\n');
 }
 
 function main() {
-  const scopedResolved = scopeCss(resolvedCss, pageSlug);
-  const scopedExtracted = extractedCss ? scopeCss(extractedCss, pageSlug) : '';
+  // F1: NO scoping — preserve original CSS verbatim (only strip @font-face)
+  const cleanedResolved = stripFontFace(stripComments(resolvedCss));
+  const cleanedExtracted = extractedCss ? stripFontFace(stripComments(extractedCss)) : '';
 
   let globalsContent = '';
   if (fs.existsSync(globalsPath)) {
@@ -321,18 +343,22 @@ function main() {
   const re = new RegExp(`${startMarkerRe}[\\s\\S]*?${endMarkerRe}\\s*`, 'g');
   let newGlobals = globalsContent.replace(re, '').trimEnd();
 
-  // Compose injection block
+  // Compose injection block — F1 (no scoping) + F2 (CSS vars in :root)
   const injection = [
     '',
     startMarker,
-    `/* Source: ${path.basename(resolvedCssPath)} — resolved CSS variables from clone Phase 1 */`,
-    scopedResolved,
+    `/* Source: ${path.basename(resolvedCssPath)} — resolved CSS (F1: no scoping, F2: vars preserved) */`,
   ];
-  if (scopedExtracted) {
+  if (cssVarsBlock) {
+    injection.push(`/* F2: CSS variables from design-tokens.json (preserved for dynamic theming) */`);
+    injection.push(cssVarsBlock.trimEnd());
+  }
+  injection.push(cleanedResolved);
+  if (cleanedExtracted) {
     injection.push(
       '',
-      `/* Source: ${path.basename(extractedCssPath)} — extracted <style> tags from clone Phase 1 */`,
-      scopedExtracted,
+      `/* Source: ${path.basename(extractedCssPath)} — extracted <style> tags */`,
+      cleanedExtracted,
     );
   }
   injection.push('', endMarker, '');
@@ -342,12 +368,16 @@ function main() {
   fs.mkdirSync(path.dirname(globalsPath), { recursive: true });
   fs.writeFileSync(globalsPath, newGlobals, 'utf-8');
   console.log(`✅ Injected ${pageSlug} CSS into ${globalsPath}`);
-  console.log(`   Resolved CSS: ${(resolvedCss.length / 1024).toFixed(1)} KB`);
-  if (extractedCss) {
-    console.log(`   Extracted CSS: ${(extractedCss.length / 1024).toFixed(1)} KB`);
+  console.log(`   F1: Selectors preserved verbatim (NO :where() scoping)`);
+  if (cssVarsBlock) console.log(`   F2: ${cssVarsBlock.split('\n').length - 2} CSS variables in :root block`);
+  console.log(`   F3: @font-face rules stripped (handled by fonts.css)`);
+  console.log(`   Resolved CSS: ${(cleanedResolved.length / 1024).toFixed(1)} KB`);
+  if (cleanedExtracted) {
+    console.log(`   Extracted CSS: ${(cleanedExtracted.length / 1024).toFixed(1)} KB`);
   }
   console.log(`   Total globals.css: ${(newGlobals.length / 1024).toFixed(1)} KB`);
-  console.log(`\n💡 Next step: Add data-page="${pageSlug}" attribute to the <main> or root element of the page component.`);
+  console.log(`\n💡 Next step: Import the page component in src/app/${pageSlug}/page.tsx`);
+  console.log(`         (CSS is global — no data-page attribute needed anymore)`);
 }
 
 main();

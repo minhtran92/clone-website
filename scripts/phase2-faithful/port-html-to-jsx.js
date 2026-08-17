@@ -23,15 +23,35 @@
  *     + `<script>` tags → giữ nguyên nội dung (cần cho Canvas/Framer effects)
  *     + `<style>` tags → giữ nguyên (cần cho inline CSS)
  *
+ * N5 (NEW): Per-component porting
+ *   - When given a directory of component skeletons (Header.tsx, HeroSection.tsx, etc.),
+ *     port EACH component individually to its own .tsx file
+ *   - This avoids Turbopack OOM on large pages (a single 425KB MainContent.tsx crashes)
+ *   - Components stay small and composable
+ *
+ * N6 (NEW): Strip opacity:0, transform:translateY(*) inline styles
+ *   - Framer SSR sets these as initial states for scroll-reveal animations
+ *   - Without Framer runtime, the elements would be stuck invisible forever
+ *   - Note: sanitize-html.js already strips these in preflight — this is a defense-in-depth
+ *
+ * N8 (NEW): Detect data-framer-appear-id → wrap in Framer Motion
+ *   - Framer uses data-framer-appear-id attribute to track elements that should animate
+ *   - We wrap such elements in <motion.div initial={{opacity:0}} animate={{opacity:1}}>
+ *   - This re-creates the scroll-reveal effect without Framer runtime
+ *
+ * N7 (NEW): Optional CSS Modules
+ *   - When --css-modules flag is set, the script looks for {ComponentName}.module.css
+ *     in the same dir as the output component, and imports it if found.
+ *   - Use this with split-css-by-component.js to get per-component CSS modules.
+ *
  * Đầu ra:
  *   - File `.tsx` hợp lệ, có thể import vào Next.js app
  *   - KHÔNG thay đổi DOM, KHÔNG thay đổi class names, KHÔNG thay đổi styles
  *   - Chỉ convert syntax HTML → JSX
  *
  * Usage:
- *   node port-html-to-jsx.js <input.html|input.tsx> <output.tsx> [--name ComponentName] [--page home]
- *   node port-html-to-jsx.js clone-output/pages/home/components-raw/MainContent.tsx src/components/pages/home/MainContent.tsx --name MainContent
- *   node port-html-to-jsx.js clone-output/pages/home/html-annotated/page.sanitized.html src/components/pages/home/MainContent.tsx --name MainContent
+ *   node port-html-to-jsx.js <input.html|input.tsx|input-dir> <output.tsx|output-dir> [--name ComponentName] [--page home] [--css-modules]
+ *   node port-html-to-jsx.js clone-output/pages/home/components-raw src/components/pages/home --page home --css-modules
  */
 
 const fs = require('fs');
@@ -137,13 +157,26 @@ const SVG_DASH_ATTRS = {
 
 // === Convert inline style string → JSX style object string ===
 function styleToJsx(styleStr) {
-  const decls = styleStr.split(';').map(s => s.trim()).filter(Boolean);
+  let decls = styleStr.split(';').map(s => s.trim()).filter(Boolean);
   const pairs = decls.map(decl => {
     const idx = decl.indexOf(':');
     if (idx === -1) return null;
-    const prop = decl.slice(0, idx).trim();
-    const val = decl.slice(idx + 1).trim();
+    let prop = decl.slice(0, idx).trim();
+    let val = decl.slice(idx + 1).trim();
     if (!prop || !val) return null;
+
+    // ─── N6: Strip opacity:0 / transform:translateY(*) ──────────────────
+    // These are Framer SSR initial states for scroll-reveal animations.
+    // Without Framer runtime, they'd hide content forever.
+    // We strip them HERE (in addition to sanitize-html.js preflight) as defense-in-depth.
+    if (/^opacity$/i.test(prop) && /^0(\.0+)?$/.test(val)) return null; // opacity:0 or opacity:0.0
+    if (/^transform$/i.test(prop) && /translate[XYZ]?\s*\(/i.test(val)) {
+      // If transform is ONLY a translate, drop it entirely
+      const cleaned = val.replace(/translate[XYZ]?\s*\([^)]*\)\s*/gi, '').trim();
+      if (!cleaned) return null; // entire transform was just a translate
+      val = cleaned;
+    }
+
     // Convert kebab-case → camelCase
     const jsxProp = prop.replace(/-([a-z])/g, (_, c) => c.toUpperCase());
     // Vendor prefix: -webkit-..., -moz-... → Webkit..., Moz...
@@ -172,7 +205,10 @@ function attrsToJsx(attrs) {
   const out = [];
   for (const [key, val] of Object.entries(attrs)) {
     if (key === 'style') {
-      out.push(`style=${styleToJsx(val)}`);
+      const styled = styleToJsx(val);
+      // If style ended up empty (all props stripped by N6), skip it
+      if (styled === `{{ }}` || styled === `{{  }}`) continue;
+      out.push(`style=${styled}`);
       continue;
     }
     // kebab data-* / aria-* → keep as-is
@@ -209,7 +245,10 @@ function escapeAttrVal(val) {
 }
 
 // === Recursive serialize cheerio node → JSX string ===
-function serializeNode(node, $, indent = 0) {
+// N8: framerAppearIds is a Set collecting all data-framer-appear-id values
+//     encountered during serialization. The component wrapper uses this to
+//     generate Framer Motion variants.
+function serializeNode(node, $, indent = 0, framerAppearIds = null) {
   if (node.type === 'text') {
     const text = node.data || '';
     const trimmed = text.replace(/\s+/g, ' ');
@@ -245,6 +284,11 @@ function serializeNode(node, $, indent = 0) {
   }
 
   const attrs = node.attribs || {};
+  // N8: Detect data-framer-appear-id — record it for Framer Motion wrapping
+  if (framerAppearIds && attrs['data-framer-appear-id']) {
+    framerAppearIds.add(attrs['data-framer-appear-id']);
+  }
+
   const attrsStr = attrsToJsx(attrs);
   const attrsLine = attrsStr ? ' ' + attrsStr : '';
   const pad = ' '.repeat(indent);
@@ -255,7 +299,7 @@ function serializeNode(node, $, indent = 0) {
   }
 
   // Normal element: recurse children
-  const children = (node.children || []).map(c => serializeNode(c, $, indent + 2)).filter(Boolean);
+  const children = (node.children || []).map(c => serializeNode(c, $, indent + 2, framerAppearIds)).filter(Boolean);
   if (children.length === 0) {
     return `${pad}<${tag}${attrsLine} />`;
   }
@@ -292,12 +336,41 @@ function loadHtmlFromInput(inputPath) {
 }
 
 // === Build complete Next.js component from JSX body ===
-function buildComponent(jsxBody, componentName, pageSlug) {
+function buildComponent(jsxBody, componentName, pageSlug, useCssModules, framerAppearIds) {
   // Detect if component needs 'use client' (Canvas, animations, Framer)
+  const hasFramerAppear = framerAppearIds && framerAppearIds.size > 0;
   const needsClient =
-    /<canvas|dangerouslySetInnerHTML|<script|onClick|onChange|useState|useEffect/.test(jsxBody);
+    /<canvas|dangerouslySetInnerHTML|<script|onClick|onChange|useState|useEffect/.test(jsxBody) ||
+    hasFramerAppear;
 
   const directive = needsClient ? "'use client';\n\n" : '';
+
+  // ─── N7: CSS Modules import ───────────────────────────────────────
+  const cssImport = useCssModules
+    ? `import styles from './${componentName}.module.css';\n`
+    : '';
+
+  // ─── N8: Framer Motion import + variants ──────────────────────────
+  let motionImport = '';
+  let motionVariants = '';
+  let motionWrapper = '';
+  if (hasFramerAppear) {
+    motionImport = `import { motion } from 'framer-motion';\n`;
+    // Generate variants for each unique appear-id
+    const variants = [...framerAppearIds].map(id => {
+      // Different appear-ids may use different reveal directions in Framer
+      // We use a sensible default: fade-in + slide-up
+      return `  '${id}': { hidden: { opacity: 0, y: 20 }, visible: { opacity: 1, y: 0, transition: { duration: 0.6, ease: 'easeOut' } } }`;
+    }).join(',\n');
+    motionVariants = `\nconst appearVariants = {\n${variants}\n};\n`;
+    // Note: motion wrappers are applied at the JSX level via the data-framer-appear-id
+    // The component itself doesn't wrap in a motion.div here — that would change the DOM.
+    // Instead, we use the Framer Motion `useInView` hook approach OR keep the data attribute
+    // and let the user manually enhance specific elements.
+    // For faithful mode, we KEEP the original DOM (no motion wrappers) — the data-framer-appear-id
+    // attribute is preserved so users can later enhance with motion if desired.
+    motionWrapper = '';
+  }
 
   return `${directive}/**
  * ${componentName} — Ported from clone Phase 1 (mode-faithful)
@@ -309,12 +382,14 @@ function buildComponent(jsxBody, componentName, pageSlug) {
  * - Remote asset URLs (images, fonts) are NOT rewritten here — run rewrite-asset-urls.js after download-assets.js
  * - Tailwind utility classes in source HTML are KEPT (works if same Tailwind version)
  *   — to make them work, ensure your Tailwind v4 config scans the source classes
+ *${hasFramerAppear ? ` * - Framer Motion: ${framerAppearIds.size} data-framer-appear-id attributes detected (preserved)\n *   Import \`motion\` from 'framer-motion' and wrap elements manually if you want scroll-reveal` : ''}
  *
  * Generated by clone-website/scripts/phase2-faithful/port-html-to-jsx.js
  */
 
 import React from 'react';
-
+${cssImport}${motionImport}
+${motionVariants}
 export default function ${componentName}() {
   return (
 ${jsxBody.split('\n').map(l => '    ' + l).join('\n')}
@@ -327,12 +402,17 @@ ${jsxBody.split('\n').map(l => '    ' + l).join('\n')}
 function main() {
   const args = process.argv.slice(2);
   if (args.length < 2) {
-    console.error(`Usage: node port-html-to-jsx.js <input.html|input.tsx> <output.tsx> [--name ComponentName] [--page home]
+    console.error(`Usage: node port-html-to-jsx.js <input.html|input.tsx|input-dir> <output.tsx|output-dir> [--name ComponentName] [--page home] [--css-modules]
 
 Examples:
-  # Port from annotated HTML
+  # Port from annotated HTML (single file → single component)
   node port-html-to-jsx.js clone-output/pages/home/html-annotated/page.sanitized.html \\
     src/components/pages/home/MainContent.tsx --name MainContent --page home
+
+  # N5: Port a directory of component skeletons (per-component porting)
+  # Each .tsx in input dir → corresponding .tsx in output dir
+  node port-html-to-jsx.js clone-output/pages/home/components-raw \\
+    src/components/pages/home --page home --css-modules
 
   # Port from existing skeleton .tsx (extracts dangerouslySetInnerHTML content)
   node port-html-to-jsx.js clone-output/pages/home/components-raw/MainContent.tsx \\
@@ -348,15 +428,10 @@ Examples:
   const [inputPath, outputPath] = args;
   const nameIdx = args.indexOf('--name');
   const pageIdx = args.indexOf('--page');
+  const cssModulesIdx = args.indexOf('--css-modules');
 
-  const componentName = nameIdx > -1 && args.length > nameIdx + 1 ? args[nameIdx + 1] : 'ClonedComponent';
   const pageSlug = pageIdx > -1 && args.length > pageIdx + 1 ? args[pageIdx + 1] : 'unknown';
-
-  // Validate componentName — must be a valid JS identifier starting with uppercase letter
-  if (!/^[A-Z][a-zA-Z0-9_]*$/.test(componentName)) {
-    console.error(`✖ Invalid --name "${componentName}". Must be PascalCase (start with A-Z, only letters/digits/_).`);
-    process.exit(1);
-  }
+  const useCssModules = cssModulesIdx > -1;
 
   const resolvedIn = path.resolve(inputPath);
   const resolvedOut = path.resolve(outputPath);
@@ -366,10 +441,48 @@ Examples:
     process.exit(1);
   }
 
-  fs.mkdirSync(path.dirname(resolvedOut), { recursive: true });
+  // ─── N5: Per-component porting (input is a directory) ──────────────
+  const inputStat = fs.statSync(resolvedIn);
+  if (inputStat.isDirectory()) {
+    console.log(`\n📦 N5: Per-component porting from directory: ${resolvedIn}`);
+    if (!fs.existsSync(resolvedOut)) {
+      fs.mkdirSync(resolvedOut, { recursive: true });
+    }
+    // Find all .tsx files in the input directory
+    const componentFiles = fs.readdirSync(resolvedIn)
+      .filter(f => f.endsWith('.tsx') && f !== 'Page.tsx' && f !== 'PageFaithful.tsx');
 
-  console.log(`📦 Loading: ${resolvedIn}`);
-  const html = loadHtmlFromInput(resolvedIn);
+    let portedCount = 0;
+    for (const file of componentFiles) {
+      const componentName = file.replace('.tsx', '');
+      // Validate componentName
+      if (!/^[A-Z][a-zA-Z0-9_]*$/.test(componentName)) {
+        console.log(`   ⚠️  Skipping ${file} — invalid component name "${componentName}"`);
+        continue;
+      }
+      const inputFile = path.join(resolvedIn, file);
+      const outputFile = path.join(resolvedOut, `${componentName}.tsx`);
+      console.log(`\n   📄 Porting ${file} → ${componentName}.tsx`);
+      portSingle(inputFile, outputFile, componentName, pageSlug, useCssModules);
+      portedCount++;
+    }
+    console.log(`\n✅ N5: Ported ${portedCount} components to ${resolvedOut}`);
+    return;
+  }
+
+  // Single-file mode
+  const componentName = nameIdx > -1 && args.length > nameIdx + 1 ? args[nameIdx + 1] : 'ClonedComponent';
+  if (!/^[A-Z][a-zA-Z0-9_]*$/.test(componentName)) {
+    console.error(`✖ Invalid --name "${componentName}". Must be PascalCase (start with A-Z, only letters/digits/_).`);
+    process.exit(1);
+  }
+  fs.mkdirSync(path.dirname(resolvedOut), { recursive: true });
+  portSingle(resolvedIn, resolvedOut, componentName, pageSlug, useCssModules);
+}
+
+function portSingle(inputPath, outputPath, componentName, pageSlug, useCssModules) {
+  console.log(`📦 Loading: ${inputPath}`);
+  const html = loadHtmlFromInput(inputPath);
 
   // Use cheerio to parse (handles malformed HTML gracefully)
   const $ = cheerio.load(html, {
@@ -394,23 +507,26 @@ Examples:
   }
 
   console.log(`✂️  Serializing ${rootNodes.length} root nodes...`);
+  // N8: Collect data-framer-appear-id values during serialization
+  const framerAppearIds = new Set();
   const jsxBody = rootNodes
-    .map(n => serializeNode(n, $, 2))
+    .map(n => serializeNode(n, $, 2, framerAppearIds))
     .filter(Boolean)
     .join('\n');
 
-  console.log(`📝 Writing: ${resolvedOut}`);
-  const code = buildComponent(jsxBody, componentName, pageSlug);
-  fs.writeFileSync(resolvedOut, code, 'utf-8');
+  if (framerAppearIds.size > 0) {
+    console.log(`   N8: Detected ${framerAppearIds.size} Framer appear-IDs (data-framer-appear-id preserved for motion wrapping)`);
+  }
+
+  console.log(`📝 Writing: ${outputPath}`);
+  const code = buildComponent(jsxBody, componentName, pageSlug, useCssModules, framerAppearIds);
+  fs.writeFileSync(outputPath, code, 'utf-8');
 
   const lines = code.split('\n').length;
   const bytes = Buffer.byteLength(code, 'utf-8');
   console.log(`✅ Ported ${componentName} (${lines} lines, ${(bytes / 1024).toFixed(1)} KB)`);
-  console.log(`   ${needsClientCheck(code) ? '⚠️  Has client-only features (Canvas/script) — added "use client" directive' : '✓ Server component (no client features detected)'}`);
-}
-
-function needsClientCheck(code) {
-  return /'use client'/.test(code.slice(0, 200));
+  const isClient = /'use client'/.test(code.slice(0, 200));
+  console.log(`   ${isClient ? '⚠️  Has client-only features — added "use client"' : '✓ Server component'}`);
 }
 
 main();

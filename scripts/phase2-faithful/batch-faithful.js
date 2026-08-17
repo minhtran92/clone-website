@@ -3,11 +3,14 @@
  * batch-faithful.js — Mode Faithful orchestrator
  *
  * Chạy toàn bộ pipeline mode-faithful cho 1 page hoặc tất cả pages:
- *   1. port-html-to-jsx.js  → Convert HTML sang JSX (PageFaithful.tsx + MainContent/Header/Footer)
- *   2. download-assets.js   → Tải ảnh remote về public/assets/{page}/ (scan WHOLE page dir, not just sanitized.html)
- *   3. download-fonts.js    → Tải fonts về public/assets/fonts/{page}/ (scan extracted.css AND resolved.css)
- *   4. rewrite-asset-urls.js → Rewrite URL trong JSX (use asset manifest + font manifest)
- *   5. inject-resolved-css.js → Inject resolved.css + extracted.css vào src/app/globals.css
+ *   1. port-html-to-jsx.js   → Convert HTML sang JSX (PER-COMPONENT — N5)
+ *                              (N6: strip opacity:0, N8: detect data-framer-appear-id)
+ *   2. download-assets.js    → Tải ảnh remote (N4: global hash-based dedup)
+ *   3. download-fonts.js     → Tải fonts (N4: global hash-based dedup)
+ *   4. rewrite-asset-urls.js → Rewrite URL trong JSX
+ *   5. split-css-modules.js  → F3+N7: Tách CSS thành .module.css per-component
+ *   6. inject-resolved-css.js → F1+F2: Inject CSS vào globals (no scoping, var() preserved)
+ *   7. generate-page.js      → F4+N9: Generate real React component tree in page.tsx
  *
  * Usage:
  *   node batch-faithful.js <clone-output-dir> --src <src-app-dir> --public <public-dir> [--page <slug>] [--all] [--allow-private]
@@ -18,9 +21,6 @@
  *
  *   # Process all pages
  *   node batch-faithful.js clone-output/pages --src src --public public --all
- *
- *   # Process localhost-cloned pages (SSRF safe with --allow-private)
- *   node batch-faithful.js clone-output/pages/home --src src --public public --page home --allow-private
  */
 
 const fs = require('fs');
@@ -32,11 +32,13 @@ if (args.length < 3) {
   console.error(`Usage: node batch-faithful.js <clone-output> --src <dir> --public <dir> [--page <slug>] [--all] [--allow-private]
 
 Pipeline:
-  1. port-html-to-jsx.js   — HTML → JSX (class→className, attrs camelCase, SVG dashed→camelCase)
-  2. download-assets.js     — Download remote images → public/assets/{page}/ (scans whole page dir)
-  3. download-fonts.js     — Download @font-face files → public/assets/fonts/{page}/
-  4. rewrite-asset-urls.js — Rewrite URLs in JSX (uses asset + font manifests)
-  5. inject-resolved-css.js — Inject resolved CSS into src/app/globals.css
+  1. port-html-to-jsx.js   — PER-COMPONENT JSX (N5+N6+N8)
+  2. download-assets.js     — Global hash dedup (N4)
+  3. download-fonts.js     — Global hash dedup (N4)
+  4. rewrite-asset-urls.js — Rewrite URLs in JSX
+  5. split-css-modules.js  — Per-component .module.css (F3+N7)
+  6. inject-resolved-css.js — No scoping + var() preserved (F1+F2)
+  7. generate-page.js      — Real React tree in page.tsx (F4+N9)
 
 Examples:
   node batch-faithful.js clone-output/pages/home --src src --public public --page home
@@ -59,7 +61,6 @@ const allowPrivate = args.includes('--allow-private');
 
 const SCRIPTS_DIR = __dirname;
 
-// Run a Node script with proper argument quoting (no shell interpolation)
 function runStep(label, scriptPath, scriptArgs) {
   console.log(`\n────────── ${label} ──────────`);
   console.log(`$ node ${scriptPath} ${scriptArgs.map(a => `"${a}"`).join(' ')}`);
@@ -76,75 +77,62 @@ function runStep(label, scriptPath, scriptArgs) {
 function processPage(pageName, pageInputDir) {
   console.log(`\n========== Processing page: ${pageName} ==========`);
   const sanitizedHtmlPath = path.join(pageInputDir, 'html-annotated', 'page.sanitized.html');
-  const mainContentPath = path.join(pageInputDir, 'components-raw', 'MainContent.tsx');
-  const headerPath = path.join(pageInputDir, 'components-raw', 'Header.tsx');
-  const footerPath = path.join(pageInputDir, 'components-raw', 'Footer.tsx');
+  const componentsRawDir = path.join(pageInputDir, 'components-raw');
   const extractedCssPath = path.join(pageInputDir, 'html-raw', 'extracted.css');
   const resolvedCssPath = path.join(pageInputDir, 'html-raw', 'resolved.css');
+  const tokensJsonPath = path.join(pageInputDir, 'html-raw', 'design-tokens.json');
 
   if (!fs.existsSync(sanitizedHtmlPath)) {
     console.error(`❌ Required file missing: ${sanitizedHtmlPath}`);
     return false;
   }
 
-  // === Step 1: Port HTML → JSX ===
+  // === Step 1: Port HTML → JSX (PER-COMPONENT — N5) ===
+  // If components-raw/ exists with .tsx files, port each individually.
+  // Otherwise, port the sanitized.html as a single PageFaithful.tsx.
   const jsxOutDir = path.join(srcDir, 'components', 'pages', pageName);
   fs.mkdirSync(jsxOutDir, { recursive: true });
 
   const allowPrivateArg = allowPrivate ? ['--allow-private'] : [];
 
-  // Port full page as Page component
-  const pageOutPath = path.join(jsxOutDir, 'PageFaithful.tsx');
-  if (!runStep('1. Port HTML → JSX (full page)',
-    path.join(SCRIPTS_DIR, 'port-html-to-jsx.js'),
-    [sanitizedHtmlPath, pageOutPath, '--name', 'PageFaithful', '--page', pageName])) return false;
-
-  // Port individual components (if MainContent exists)
-  if (fs.existsSync(mainContentPath)) {
-    runStep('1b. Port MainContent.tsx',
+  if (fs.existsSync(componentsRawDir)) {
+    // N5: Per-component porting
+    const componentFiles = fs.readdirSync(componentsRawDir).filter(f => f.endsWith('.tsx') && f !== 'Page.tsx');
+    if (componentFiles.length > 0) {
+      console.log(`   📦 N5: Per-component porting (${componentFiles.length} components found)`);
+      if (!runStep('1. Port HTML → JSX (PER-COMPONENT — N5+N6+N8)',
+        path.join(SCRIPTS_DIR, 'port-html-to-jsx.js'),
+        [componentsRawDir, jsxOutDir, '--page', pageName, '--css-modules'])) return false;
+    } else {
+      // Fall back to single-file port
+      if (!runStep('1. Port HTML → JSX (single PageFaithful)',
+        path.join(SCRIPTS_DIR, 'port-html-to-jsx.js'),
+        [sanitizedHtmlPath, path.join(jsxOutDir, 'PageFaithful.tsx'), '--name', 'PageFaithful', '--page', pageName])) return false;
+    }
+  } else {
+    if (!runStep('1. Port HTML → JSX (single PageFaithful)',
       path.join(SCRIPTS_DIR, 'port-html-to-jsx.js'),
-      [mainContentPath, path.join(jsxOutDir, 'MainContent.tsx'), '--name', 'MainContent', '--page', pageName]);
-  }
-  if (fs.existsSync(headerPath)) {
-    runStep('1c. Port Header.tsx',
-      path.join(SCRIPTS_DIR, 'port-html-to-jsx.js'),
-      [headerPath, path.join(jsxOutDir, 'Header.tsx'), '--name', 'Header', '--page', pageName]);
-  }
-  if (fs.existsSync(footerPath)) {
-    runStep('1d. Port Footer.tsx',
-      path.join(SCRIPTS_DIR, 'port-html-to-jsx.js'),
-      [footerPath, path.join(jsxOutDir, 'Footer.tsx'), '--name', 'Footer', '--page', pageName]);
+      [sanitizedHtmlPath, path.join(jsxOutDir, 'PageFaithful.tsx'), '--name', 'PageFaithful', '--page', pageName])) return false;
   }
 
-  // === Step 2: Download assets ===
-  // Scan the WHOLE page input dir (html-raw, html-annotated, components-raw, components-css)
-  // — not just sanitized.html — so we catch URLs in MainContent.tsx (which has the bulk of HTML via dangerouslySetInnerHTML).
-  const assetsOutDir = path.join(publicDir, 'assets', pageName);
-  if (!runStep('2. Download assets (whole page dir)',
+  // === Step 2: Download assets (N4: global hash dedup) ===
+  const assetsOutDir = path.join(publicDir, 'assets');
+  if (!runStep('2. Download assets (N4: global hash dedup)',
     path.join(SCRIPTS_DIR, 'download-assets.js'),
     [pageInputDir, '--out', assetsOutDir, '--page', pageName, ...allowPrivateArg])) {
     console.warn('⚠️  Asset download had issues, continuing...');
   }
   const manifestPath = path.join(assetsOutDir, `${pageName}-assets-manifest.json`);
 
-  // === Step 3: Download fonts ===
-  // Scan both extracted.css AND resolved.css (resolved.css may have additional @font-face declarations)
+  // === Step 3: Download fonts (N4: global hash dedup) ===
   const fontsOutDir = path.join(publicDir, 'assets', 'fonts');
-  const cssInputsForFonts = [];
-  if (fs.existsSync(extractedCssPath)) cssInputsForFonts.push(extractedCssPath);
-  if (fs.existsSync(resolvedCssPath) && resolvedCssPath !== extractedCssPath) {
-    // download-fonts.js can take a single file or a directory. We pass the html-raw dir
-    // so it picks up both extracted.css and resolved.css.
-  }
-  if (cssInputsForFonts.length > 0) {
-    const fontsInputDir = path.join(pageInputDir, 'html-raw');
-    if (fs.existsSync(fontsInputDir)) {
-      runStep('3. Download fonts (extracted.css + resolved.css)',
-        path.join(SCRIPTS_DIR, 'download-fonts.js'),
-        [fontsInputDir, '--out', fontsOutDir, '--page', pageName, ...allowPrivateArg]);
-    }
+  const fontsInputDir = path.join(pageInputDir, 'html-raw');
+  if (fs.existsSync(fontsInputDir)) {
+    runStep('3. Download fonts (N4: global hash dedup)',
+      path.join(SCRIPTS_DIR, 'download-fonts.js'),
+      [fontsInputDir, '--out', fontsOutDir, '--page', pageName, ...allowPrivateArg]);
   } else {
-    console.log('\n────────── 3. Download fonts (skipped, no extracted.css or resolved.css) ──────────');
+    console.log('\n────────── 3. Download fonts (skipped, no html-raw dir) ──────────');
   }
   const fontsManifestPath = path.join(fontsOutDir, pageName, 'fonts-manifest.json');
 
@@ -154,14 +142,28 @@ function processPage(pageName, pageInputDir) {
     if (fs.existsSync(fontsManifestPath)) {
       rewriteArgs.push('--fonts-manifest', fontsManifestPath);
     }
-    if (!runStep('4. Rewrite asset URLs (JSX + fonts)', path.join(SCRIPTS_DIR, 'rewrite-asset-urls.js'), rewriteArgs)) {
+    if (!runStep('4. Rewrite asset URLs', path.join(SCRIPTS_DIR, 'rewrite-asset-urls.js'), rewriteArgs)) {
       console.warn('⚠️  URL rewrite had issues, continuing...');
     }
   } else {
     console.log('\n────────── 4. Rewrite asset URLs (skipped, no manifest) ──────────');
   }
 
-  // === Step 5: Inject resolved CSS into globals.css ===
+  // === Step 5: Split CSS into per-component .module.css (F3 + N7) ===
+  if (fs.existsSync(extractedCssPath) && fs.existsSync(componentsRawDir)) {
+    runStep('5. Split CSS into .module.css (F3+N7)',
+      path.join(SCRIPTS_DIR, 'split-css-modules.js'),
+      [extractedCssPath, componentsRawDir, jsxOutDir]);
+  } else if (fs.existsSync(extractedCssPath)) {
+    // No components-raw/ — split with just the ported JSX dir
+    runStep('5. Split CSS into .module.css (F3+N7)',
+      path.join(SCRIPTS_DIR, 'split-css-modules.js'),
+      [extractedCssPath, jsxOutDir, jsxOutDir]);
+  } else {
+    console.log('\n────────── 5. Split CSS (skipped, no extracted.css) ──────────');
+  }
+
+  // === Step 6: Inject resolved CSS into globals.css (F1+F2) ===
   const globalsPath = path.join(srcDir, 'app', 'globals.css');
   if (fs.existsSync(resolvedCssPath)) {
     const injectArgs = [resolvedCssPath];
@@ -169,18 +171,62 @@ function processPage(pageName, pageInputDir) {
       injectArgs.push('--extracted', extractedCssPath);
     }
     injectArgs.push('--globals', globalsPath, '--page', pageName);
-    runStep('5. Inject resolved CSS', path.join(SCRIPTS_DIR, 'inject-resolved-css.js'), injectArgs);
+    if (fs.existsSync(tokensJsonPath)) {
+      injectArgs.push('--tokens', tokensJsonPath);
+    }
+    runStep('6. Inject resolved CSS (F1: no scope, F2: vars preserved)', path.join(SCRIPTS_DIR, 'inject-resolved-css.js'), injectArgs);
   } else {
-    console.log('\n────────── 5. Inject resolved CSS (skipped, no resolved.css) ──────────');
+    console.log('\n────────── 6. Inject resolved CSS (skipped, no resolved.css) ──────────');
+  }
+
+  // === Step 7: Generate page.tsx with real React component tree (F4+N9) ===
+  // Determine the route path from pageName
+  const routePath = pageName === 'home' ? '/' : `/${pageName.replace(/_/g, '/')}`;
+  const pageOutputPath = pageName === 'home'
+    ? path.join(srcDir, 'app', 'page.tsx')
+    : path.join(srcDir, 'app', ...pageName.split('_'), 'page.tsx');
+
+  // Only generate if components were ported individually (not single PageFaithful)
+  const portedComponents = fs.existsSync(jsxOutDir)
+    ? fs.readdirSync(jsxOutDir).filter(f => f.endsWith('.tsx') && f !== 'PageFaithful.tsx')
+    : [];
+  if (portedComponents.length > 0) {
+    runStep('7. Generate page.tsx (F4+N9: real React tree)',
+      path.join(SCRIPTS_DIR, 'generate-page.js'),
+      [jsxOutDir, pageOutputPath, '--page', pageName, '--route', routePath]);
+  } else {
+    // Single PageFaithful.tsx — generate a simpler page.tsx that imports it
+    const pageDir = path.dirname(pageOutputPath);
+    fs.mkdirSync(pageDir, { recursive: true });
+    const simplePage = `// Auto-generated by batch-faithful.js
+import PageFaithful from '@/components/pages/${pageName}/PageFaithful';
+
+export const metadata = {
+  title: '${pageName}',
+  description: 'Cloned page (Mode Faithful)',
+};
+
+export default function Page() {
+  return (
+    <main data-page="${pageName}">
+      <PageFaithful />
+    </main>
+  );
+}
+`;
+    fs.writeFileSync(pageOutputPath, simplePage, 'utf-8');
+    console.log(`\n────────── 7. Generated simple page.tsx (PageFaithful) ──────────`);
+    console.log(`   ${pageOutputPath}`);
   }
 
   console.log(`\n✅ Page "${pageName}" complete.`);
   console.log(`   - JSX components: ${jsxOutDir}/`);
-  console.log(`   - Assets: ${assetsOutDir}/`);
-  console.log(`   - Fonts: ${fontsOutDir}/${pageName}/`);
-  console.log(`   - globals.css updated with [data-page="${pageName}"] scope`);
-  console.log(`\n   NEXT: Add 'data-page="${pageName}"' attribute to root element in app/${pageName}/page.tsx`);
-  console.log(`         Import components: import PageFaithful from '@/components/pages/${pageName}/PageFaithful';`);
+  console.log(`   - CSS modules: ${jsxOutDir}/*.module.css`);
+  console.log(`   - Assets: ${assetsOutDir}/ (global hash-based)`);
+  console.log(`   - Fonts: ${fontsOutDir}/ (global hash-based)`);
+  console.log(`   - globals.css updated (F1: no scoping, F2: var() preserved)`);
+  console.log(`   - page.tsx: ${pageOutputPath}`);
+  console.log(`\n   NEXT: Run dev server and visit ${routePath === '/' ? '/' : routePath}`);
   return true;
 }
 

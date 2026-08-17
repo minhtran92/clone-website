@@ -25,6 +25,7 @@ const fs = require('fs');
 const path = require('path');
 const https = require('https');
 const http = require('http');
+const crypto = require('crypto');
 
 const args = process.argv.slice(2);
 if (args.length < 1) {
@@ -204,10 +205,38 @@ async function downloadFont(fontUrl, outAbs) {
   try {
     const buffer = await fetchWithRedirects(fontUrl);
     fs.writeFileSync(outAbs, buffer);
-    return { ok: true, bytes: buffer.length };
+    return { ok: true, bytes: buffer.length, buffer };
   } catch (e) {
     return { ok: false, error: e.message };
   }
+}
+
+// ─── N4: Global font dedup (hash-based) ─────────────────────────────────
+// Fonts are shared across ALL pages (Inter, Azeret Mono, Source Serif 4 etc.)
+// Without dedup: 148 fonts × 9 pages = 1332 files (~85% wasted space)
+// With dedup: ~20 unique fonts total, reused across pages
+const globalFontUrlMap = new Map();
+
+function loadGlobalFontMap(outDir) {
+  const mapPath = path.join(outDir, '_font-url-map.json');
+  if (fs.existsSync(mapPath)) {
+    try {
+      return new Map(Object.entries(JSON.parse(fs.readFileSync(mapPath, 'utf-8'))));
+    } catch (e) {
+      console.warn(`   ⚠️  Failed to load _font-url-map.json: ${e.message}`);
+    }
+  }
+  return new Map();
+}
+
+function saveGlobalFontMap(outDir, map) {
+  const mapPath = path.join(outDir, '_font-url-map.json');
+  fs.writeFileSync(mapPath, JSON.stringify(Object.fromEntries(map), null, 2));
+}
+
+function hashFontPath(hash, ext) {
+  const prefix = hash.slice(0, 2);
+  return path.join('_hash', prefix, `${hash}${ext}`);
 }
 
 function formatScore(src) {
@@ -256,15 +285,40 @@ async function processCssFile(cssPath, outDir, pageSlug) {
       const pathname = parsedUrl.pathname || '';
       const ext = path.extname(pathname).toLowerCase()
         || (srcEntry.format === 'woff2' ? '.woff2' : srcEntry.format === 'woff' ? '.woff' : srcEntry.format === 'truetype' ? '.ttf' : '.woff2');
-      const filename = `${slug}${ext}`;
-      const outAbs = path.join(outDir, pageSlug, filename);
-      const localRel = `/assets/fonts/${pageSlug}/${filename}`;
 
-      const r = await downloadFont(srcEntry.url, outAbs);
-      if (r.ok) {
-        console.log(`   ✅ ${face.family} ${face.weight}/${face.style} → ${localRel} (${(r.bytes / 1024).toFixed(1)} KB)`);
-        downloads.push({ remoteUrl: srcEntry.url, localPath: localRel, bytes: r.bytes, family: face.family, weight: face.weight });
+      // ─── N4: Use global font dedup (hash-based) ────────────────────────
+      // Check if we've already downloaded this URL
+      if (globalFontUrlMap.has(srcEntry.url)) {
+        const localRel = globalFontUrlMap.get(srcEntry.url);
+        downloads.push({ remoteUrl: srcEntry.url, localPath: localRel, bytes: 0, family: face.family, weight: face.weight, dedupHit: true });
         newSrcEntries.push({ url: localRel, format: srcEntry.format || (ext === '.woff2' ? 'woff2' : ext === '.woff' ? 'woff' : ext === '.ttf' ? 'truetype' : null) });
+        continue;
+      }
+
+      const filename = `${slug}${ext}`;
+      // Write to a temp path first to compute hash, then move to global hash path
+      const tmpOutAbs = path.join(outDir, pageSlug, filename);
+      const r = await downloadFont(srcEntry.url, tmpOutAbs);
+      if (r.ok) {
+        // Compute content hash and move to global path
+        const hash = crypto.createHash('sha1').update(r.buffer).digest('hex');
+        const hashRel = hashFontPath(hash, ext);
+        const hashAbs = path.join(outDir, hashRel);
+        const localRel = '/' + hashRel.split(path.sep).join('/').replace(/^assets\//, 'assets/fonts/').replace(/^\/?/, '/');
+        // For simplicity, use /assets/fonts/_hash/... path
+        const fontLocalRel = `/assets/fonts/_hash/${hash.slice(0, 2)}/${hash}${ext}`;
+
+        if (!fs.existsSync(hashAbs)) {
+          fs.mkdirSync(path.dirname(hashAbs), { recursive: true });
+          fs.copyFileSync(tmpOutAbs, hashAbs);
+        }
+        // Remove the per-page temp file (keep only the hash-based global file)
+        if (fs.existsSync(tmpOutAbs)) fs.unlinkSync(tmpOutAbs);
+
+        console.log(`   ✅ ${face.family} ${face.weight}/${face.style} → ${fontLocalRel} (${(r.bytes / 1024).toFixed(1)} KB)`);
+        globalFontUrlMap.set(srcEntry.url, fontLocalRel);
+        downloads.push({ remoteUrl: srcEntry.url, localPath: fontLocalRel, bytes: r.bytes, family: face.family, weight: face.weight });
+        newSrcEntries.push({ url: fontLocalRel, format: srcEntry.format || (ext === '.woff2' ? 'woff2' : ext === '.woff' ? 'woff' : ext === '.ttf' ? 'truetype' : null) });
       } else {
         console.log(`   ❌ ${face.family} ${face.weight}/${face.style}: ${r.error}`);
         // Try next-best format if available
@@ -272,11 +326,22 @@ async function processCssFile(cssPath, outDir, pageSlug) {
           const fallback = downloadable[i];
           const fbExt = path.extname(new URL(fallback.url).pathname || '') || '.woff2';
           const fbFilename = `${slug}${fbExt}`;
-          const fbOutAbs = path.join(outDir, pageSlug, fbFilename);
-          const fbLocalRel = `/assets/fonts/${pageSlug}/${fbFilename}`;
-          const fbR = await downloadFont(fallback.url, fbOutAbs);
+          const fbTmpOutAbs = path.join(outDir, pageSlug, fbFilename);
+          const fbR = await downloadFont(fallback.url, fbTmpOutAbs);
           if (fbR.ok) {
+            const fbHash = crypto.createHash('sha1').update(fbR.buffer).digest('hex');
+            const fbHashRel = hashFontPath(fbHash, fbExt);
+            const fbHashAbs = path.join(outDir, fbHashRel);
+            const fbLocalRel = `/assets/fonts/_hash/${fbHash.slice(0, 2)}/${fbHash}${fbExt}`;
+
+            if (!fs.existsSync(fbHashAbs)) {
+              fs.mkdirSync(path.dirname(fbHashAbs), { recursive: true });
+              fs.copyFileSync(fbTmpOutAbs, fbHashAbs);
+            }
+            if (fs.existsSync(fbTmpOutAbs)) fs.unlinkSync(fbTmpOutAbs);
+
             console.log(`   ↳ fallback ✅ ${face.family}: ${fbLocalRel} (${(fbR.bytes / 1024).toFixed(1)} KB)`);
+            globalFontUrlMap.set(fallback.url, fbLocalRel);
             downloads.push({ remoteUrl: fallback.url, localPath: fbLocalRel, bytes: fbR.bytes, family: face.family, weight: face.weight });
             newSrcEntries.push({ url: fbLocalRel, format: fallback.format });
             break;
@@ -367,6 +432,15 @@ async function main() {
   }
   fs.mkdirSync(outDir, { recursive: true });
 
+  // ─── N4: Load existing global font URL map (dedup across pages) ────────
+  const existingMap = loadGlobalFontMap(outDir);
+  for (const [url, localPath] of existingMap) {
+    globalFontUrlMap.set(url, localPath);
+  }
+  if (existingMap.size > 0) {
+    console.log(`\n   📋 Loaded ${existingMap.size} entries from global font URL map (will dedup hits)`);
+  }
+
   if (batch) {
     const pagesDir = resolvedIn;
     const pages = fs.readdirSync(pagesDir, { withFileTypes: true })
@@ -380,6 +454,10 @@ async function main() {
   } else {
     await processInput(resolvedIn, outDir, pageSlug);
   }
+
+  // ─── N4: Persist global font URL map for next run ──────────────────────
+  saveGlobalFontMap(outDir, globalFontUrlMap);
+  console.log(`\n📋 Saved global font URL map (${globalFontUrlMap.size} entries)`);
 }
 
 main().catch(e => {

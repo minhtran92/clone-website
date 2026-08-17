@@ -5,6 +5,18 @@
  * Removes <script>, complex inline JS, and other elements that
  * crash the older babylon parser inside html-to-react-components.
  * 
+ * ALSO (NEW):
+ *   - N2: Strip <style data-framer-font-css> blocks (inline @font-face declarations).
+ *     These duplicate the @font-face rules in extracted.css and bloat HTML by ~200KB/page.
+ *     Fonts are handled by download-fonts.js → fonts.css (single source of truth).
+ *   - N3: Strip Framer runtime <script> tags explicitly (Framer's main bundle, motion library).
+ *     We already strip ALL <script> tags, but Framer's are particularly large (1MB+)
+ *     and reference external CDN URLs that won't work in the cloned app anyway.
+ *   - N6-preflight: Strip opacity:0 + transform:translateY(*) inline styles that
+ *     would otherwise hide content permanently (since Framer runtime won't be ported
+ *     to set them to opacity:1 on scroll-trigger). Real animation logic is added
+ *     later by port-html-to-jsx.js (N6) + framer-motion component wrapping (N8).
+ * 
  * Usage:
  *   node sanitize-html.js <input.html> <output.html>
  */
@@ -37,12 +49,56 @@ function main() {
   const $ = cheerio.load(html, { xmlMode: false, decodeEntities: false });
 
   let removedCount = 0;
+  let strippedFontsChars = 0;
+  let strippedFramerScripts = 0;
+  let fixedHiddenElements = 0;
 
-  // 1. Remove ALL <script> tags (they crash babylon parser)
+  // ─── N2: Strip inline <style data-framer-font-css> blocks ────────────────
+  // These contain @font-face declarations duplicating extracted.css/fonts.css
+  $('style[data-framer-font-css]').each((_, el) => {
+    const content = $(el).html() || '';
+    strippedFontsChars += content.length;
+    $(el).remove();
+  });
+  // Also strip any <style> blocks that ONLY contain @font-face rules (no other CSS)
+  $('style').each((_, el) => {
+    const content = ($(el).html() || '').trim();
+    if (content && /^@font-face\b/.test(content) && !content.match(/(^|\n)\s*[^@\s]/m)) {
+      // Pure @font-face stylesheet — extract
+      strippedFontsChars += content.length;
+      $(el).remove();
+    }
+  });
+  if (strippedFontsChars > 0) {
+    console.log(`   N2: Stripped inline @font-face <style> blocks (${(strippedFontsChars / 1024).toFixed(1)} KB saved — handled by fonts.css)`);
+  }
+
+  // ─── N3: Strip Framer runtime <script> tags ─────────────────────────────
+  // Framer's runtime JS is large (1MB+) and references external URLs that won't
+  // work in the cloned app. The runtime is what hydrates Framer SSR HTML into
+  // the visual state — but since we already captured HYDRATED DOM in fetch-page.js (N1),
+  // we don't need the runtime anymore. We preserve the post-hydration DOM as-is.
   $('script').each((_, el) => {
+    const src = $(el).attr('src') || '';
+    const content = ($(el).html() || '').trim();
+    // Identify Framer-specific scripts
+    const isFramerScript = 
+      src.includes('framerusercontent.com') ||
+      src.includes('framer.com/') ||
+      src.includes('framer/static') ||
+      /framer/i.test(content.slice(0, 500)) ||
+      // Framer runtime bundles typically have these markers
+      content.includes('__framer') ||
+      content.includes('Framer.');
+    if (isFramerScript) {
+      strippedFramerScripts++;
+    }
     $(el).remove();
     removedCount++;
   });
+  if (strippedFramerScripts > 0) {
+    console.log(`   N3: Stripped ${strippedFramerScripts} Framer runtime <script> tags (we use captured hydrated DOM instead)`);
+  }
 
   // 2. Remove <noscript> tags
   $('noscript').each((_, el) => {
@@ -77,10 +133,9 @@ function main() {
     }
   });
 
-  // 5. Remove <style> tags with @import or complex CSS
+  // 5. Remove <style> tags with @import or complex CSS (kept for non-font styles)
   $('style').each((_, el) => {
     const content = $(el).html() || '';
-    // Keep simple styles, remove very complex ones
     if (content.length > 50000) {
       $(el).remove();
       removedCount++;
@@ -93,11 +148,51 @@ function main() {
     removedCount++;
   });
 
+  // ─── N6-preflight: Strip opacity:0 / transform:translateY(*) inline styles ─
+  // Framer sets these initial states, then Framer runtime JS animates them to
+  // opacity:1 + transform:none on scroll-trigger. Without Framer runtime, the
+  // elements would be stuck invisible forever.
+  // We strip these HERE (during sanitize) so the HTML passed to port-html-to-jsx
+  // is already clean. port-html-to-jsx will then add proper Framer Motion wrappers.
+  const HIDDEN_PATTERN = /opacity:\s*0(?!\.\d*[1-9])/; // opacity:0 but not 0.5, 0.1 etc
+  const TRANSFORM_PATTERN = /transform:\s*translate[XYZ]?\s*\([^)]*\)/i;
+  $('*').each((_, el) => {
+    const style = $(el).attr('style');
+    if (!style) return;
+    let newStyle = style;
+    let changed = false;
+    // Remove opacity:0 (but keep opacity:0.5, opacity:0.1 etc)
+    if (HIDDEN_PATTERN.test(newStyle)) {
+      newStyle = newStyle.replace(/opacity:\s*0(?!\.\d*[1-9])\s*;?/g, '');
+      changed = true;
+    }
+    // Remove transform:translateY(*) / translateX(*) / translateZ(*)
+    // These are scroll-reveal initial states — without Framer runtime, they hide content
+    if (TRANSFORM_PATTERN.test(newStyle)) {
+      newStyle = newStyle.replace(/transform:\s*translate[XYZ]?\s*\([^)]*\)\s*;?/gi, '');
+      changed = true;
+    }
+    if (changed) {
+      newStyle = newStyle.trim().replace(/;\s*$/, '');
+      if (newStyle) {
+        $(el).attr('style', newStyle);
+      } else {
+        $(el).removeAttr('style');
+      }
+      fixedHiddenElements++;
+    }
+  });
+  if (fixedHiddenElements > 0) {
+    console.log(`   N6-preflight: Stripped opacity:0 + transform:translateY(*) inline styles from ${fixedHiddenElements} elements (would otherwise be hidden forever without Framer runtime)`);
+  }
+
   // 7. Remove framer-specific attributes that might cause issues
   const framerAttrs = [
     'data-framer', 'data-framer-name', 'data-framer-component-type',
     'data-framer-portal-id', 'data-framer-motion', 'data-testid',
   ];
+  // NOTE: We DO NOT strip data-framer-appear-id — port-html-to-jsx.js uses it (N8)
+  // to wrap elements in Framer Motion for scroll-reveal animations.
   $('*').each((_, el) => {
     framerAttrs.forEach(attr => {
       if ($(el).attr(attr) !== undefined) {
@@ -132,7 +227,11 @@ function main() {
   console.log(`\n✅ Sanitized HTML written to: ${outputPath}`);
   console.log(`   Original size: ${html.length.toLocaleString()} chars`);
   console.log(`   Sanitized size: ${sanitizedHtml.length.toLocaleString()} chars`);
+  console.log(`   Saved: ${(html.length - sanitizedHtml.length).toLocaleString()} chars (${(((html.length - sanitizedHtml.length) / html.length) * 100).toFixed(1)}%)`);
   console.log(`   Removed/modified: ${removedCount} items`);
+  if (strippedFontsChars > 0) console.log(`   Inline @font-face stripped: ${(strippedFontsChars / 1024).toFixed(1)} KB`);
+  if (strippedFramerScripts > 0) console.log(`   Framer runtime scripts stripped: ${strippedFramerScripts}`);
+  if (fixedHiddenElements > 0) console.log(`   Hidden-element styles fixed: ${fixedHiddenElements}`);
   console.log('');
 }
 

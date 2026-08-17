@@ -91,15 +91,50 @@ async function fetchWithAgentBrowser(url, outputDir) {
   run(`agent-browser open "${url}"`, { timeout: 20000 });
   run('agent-browser wait 3000');
 
-  // 2. Full HTML source
-  console.log('2️⃣  Full HTML source...');
+  // ───────────────────────────────────────────────────────────
+  // N1: Capture HYDRATED DOM — Framer/Webflow sites render via
+  // client-side JS. SSR HTML has many elements stuck at opacity:0
+  // or with display:none, then Framer runtime reveals them on
+  // scroll/load. To capture the FINAL visual state:
+  //   1. Wait for network to be idle (Framer runtime finished)
+  //   2. Scroll through page top→bottom to trigger IntersectionObserver
+  //      animations (which sets opacity:1, transforms: none)
+  //   3. Scroll back to top
+  //   4. THEN capture HTML — this gives us post-hydration DOM
+  // ───────────────────────────────────────────────────────────
+  console.log('   🔄 N1: Hydrating DOM (scroll-trigger animations)...');
+  // Try waiting for networkidle (agent-browser may not support this directly,
+  // so we use a fallback of progressive waits)
+  run('agent-browser wait 2000');
+
+  // Capture page height to know how far to scroll
+  const pageHeight = evalNumber('document.body.scrollHeight') || 5000;
+  console.log(`   📐 Page scrollHeight: ${pageHeight}px`);
+
+  // Scroll through the page in 600px increments, 400ms pause between
+  // — this triggers IntersectionObserver-based reveal animations
+  const scrollStep = 600;
+  const scrollDelay = 400;
+  for (let y = 0; y <= pageHeight; y += scrollStep) {
+    run(`agent-browser eval "window.scrollTo(0, ${y})"`, { timeout: 5000 });
+    run(`agent-browser wait ${scrollDelay}`);
+  }
+  // Scroll back to top for the final state
+  run('agent-browser eval "window.scrollTo(0, 0)"', { timeout: 5000 });
+  run('agent-browser wait 800');
+
+  // Now DOM is hydrated — elements have final inline styles
+  // 2. Full HTML source (POST-hydration)
+  console.log('2️⃣  Full HTML source (post-hydration)...');
   const fullHtml = evalString('document.documentElement.outerHTML');
   if (!fullHtml || fullHtml.length < 100) {
     console.error('❌ Failed to get HTML, falling back to page_reader');
     return fetchWithPageReader(url, outputDir);
   }
   fs.writeFileSync(path.join(outputDir, 'page.html'), fullHtml, 'utf-8');
-  console.log(`   HTML: ${fullHtml.length.toLocaleString()} chars`);
+  // Also save a pre-hydration SSR HTML snapshot for debugging
+  // (page.html will be the post-hydration version — used downstream)
+  console.log(`   HTML (hydrated): ${fullHtml.length.toLocaleString()} chars`);
 
   const title = evalString('document.title') || 'Untitled';
 

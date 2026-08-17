@@ -1,16 +1,30 @@
 #!/usr/bin/env node
 /**
- * resolve-css-vars.js — Step 1b: Resolve CSS variables to actual computed values
- * 
- * Framer/Webflow sites use CSS variables like:
- *   var(--token-d30ec737-b2b1-4799-8d32-14510e319882, rgb(255, 255, 227))
- * 
- * This script resolves them to their fallback values (or computed values from the page),
- * making the CSS self-contained and easier to convert to Tailwind.
- * 
+ * resolve-css-vars.js — Step 1b: Resolve CSS variables (CHANGED — F2)
+ *
+ * F2 (NEW STRATEGY):
+ *   OLD: Resolve `var(--token, fallback)` → fallback value (or computed value
+ *        from design-tokens.json). This bakes in static values and breaks
+ *        dynamic theming (dark mode, theme switching).
+ *   NEW: KEEP `var(--token)` references in the CSS. Just extract the
+ *        `:root { --token: value }` declarations from design-tokens.json
+ *        and write them to a separate `tokens.css` file. The original CSS
+ *        keeps its `var(--token)` references intact, and the tokens.css
+ *        provides the runtime values via standard CSS custom properties.
+ *
+ *   This means:
+ *     - CSS variables work exactly like in the original site
+ *     - Dark mode / theme switching is preserved (just override `:root`)
+ *     - Framer's CSS custom properties (data-framer-* etc.) still work
+ *     - Smaller resolved.css (no var() expansion duplication)
+ *
+ * Output files:
+ *   - <output-file> — original CSS with var() refs PRESERVED (no expansion)
+ *   - <tokens-json> — design tokens JSON (with `cssVars` block updated
+ *                     to include all custom properties from source CSS)
+ *
  * Usage:
  *   node resolve-css-vars.js <css-file> <output-file> [tokens-json]
- *   node resolve-css-vars.js clone-output/html-raw/extracted.css clone-output/html-raw/resolved.css
  */
 
 const fs = require('fs');
@@ -34,7 +48,7 @@ function main() {
 
   const css = fs.readFileSync(cssPath, 'utf-8');
 
-  // Load computed CSS variable values if available
+  // ─── F2: Load existing tokens (may have computed values from fetch-page.js) ───
   let computedVars = {};
   if (tokensPath && fs.existsSync(tokensPath)) {
     try {
@@ -43,56 +57,80 @@ function main() {
     } catch {}
   }
 
-  // Pattern: var(--token-xxx, fallback-value)
-  // Also: var(--extracted-xxx, var(--token-yyy, fallback))
-  const varPattern = /var\((--[^,)]+)(?:\s*,\s*([^)]+))?\)/g;
-
-  let resolved = css;
-  let resolveCount = 0;
-  let fallbackCount = 0;
-
-  // Multi-pass resolution (handles nested var() references)
-  for (let pass = 0; pass < 3; pass++) {
-    resolved = resolved.replace(varPattern, (match, varName, fallback) => {
-      // Check computed values first
-      if (computedVars[varName]) {
-        resolveCount++;
-        return computedVars[varName];
+  // ─── F2: Extract --token: value declarations from :root in source CSS ───
+  // This preserves the original site's CSS variable definitions.
+  // Pattern: :root { --foo: bar; --baz: qux; }
+  const rootVarDecls = {};
+  const rootBlockRe = /:root\s*\{([^}]*)\}/g;
+  let m;
+  while ((m = rootBlockRe.exec(css)) !== null) {
+    const body = m[1];
+    const decls = body.split(';').map(s => s.trim()).filter(Boolean);
+    for (const decl of decls) {
+      const colonIdx = decl.indexOf(':');
+      if (colonIdx === -1) continue;
+      const propName = decl.slice(0, colonIdx).trim();
+      const value = decl.slice(colonIdx + 1).trim();
+      if (propName.startsWith('--') && value) {
+        rootVarDecls[propName] = value;
       }
-      
-      // Use fallback value if available
-      if (fallback) {
-        fallbackCount++;
-        // Recursively resolve nested var() in fallback
-        return fallback.trim();
-      }
-
-      // No resolution possible — keep as-is
-      return match;
-    });
+    }
   }
 
-  // Also resolve --framer-text-color and --extracted-* in inline styles
-  // These are in the component HTML as: style="--framer-text-color: var(--token-xxx, rgb(...))"
-  // After resolution, they become: style="--framer-text-color: rgb(...)"
+  // ─── F2: Also scan for :where(:root), html, body with --vars ───
+  // Some sites define vars on <html> or <body> instead of :root
+  const htmlBodyVarRe = /(?:html|body)\s*\{([^}]*?--[a-zA-Z-]+[^}]*?)\}/g;
+  while ((m = htmlBodyVarRe.exec(css)) !== null) {
+    const body = m[1];
+    const decls = body.split(';').map(s => s.trim()).filter(Boolean);
+    for (const decl of decls) {
+      const colonIdx = decl.indexOf(':');
+      if (colonIdx === -1) continue;
+      const propName = decl.slice(0, colonIdx).trim();
+      const value = decl.slice(colonIdx + 1).trim();
+      if (propName.startsWith('--') && value && !rootVarDecls[propName]) {
+        rootVarDecls[propName] = value;
+      }
+    }
+  }
 
-  // Clean up remaining unresolved CSS vars that have no useful fallback
-  // Replace with a comment noting they need manual resolution
-  const stillUnresolved = (resolved.match(/var\(--[^,)]+\)/g) || []).length;
+  // Merge: prefer computed values (from browser) over static root decls
+  const mergedVars = { ...rootVarDecls, ...computedVars };
 
-  // Ensure output directory exists
-  const outputDir = path.dirname(outputPath);
-  if (!fs.existsSync(outputDir)) fs.mkdirSync(outputDir, { recursive: true });
-
-  fs.writeFileSync(outputPath, resolved, 'utf-8');
-
-  console.log(`\n🔧 CSS Variable Resolution:`);
+  console.log(`\n🔧 CSS Variable Resolution (F2 — preserve var() refs):`);
   console.log(`   Input: ${css.length.toLocaleString()} chars`);
-  console.log(`   Output: ${resolved.length.toLocaleString()} chars`);
-  console.log(`   Resolved from computed: ${resolveCount}`);
-  console.log(`   Resolved from fallback: ${fallbackCount}`);
-  console.log(`   Still unresolved: ${stillUnresolved}`);
-  console.log(`   ✅ Written to: ${outputPath}`);
+  console.log(`   Source CSS vars extracted from :root/html/body: ${Object.keys(rootVarDecls).length}`);
+  console.log(`   Computed CSS vars (from design-tokens.json): ${Object.keys(computedVars).length}`);
+  console.log(`   Merged total: ${Object.keys(mergedVars).length}`);
+
+  // ─── F2: Output CSS with var() refs PRESERVED ───
+  // We DON'T expand var(--token) anymore — keep them as-is.
+  // Just write the original CSS verbatim (var refs preserved).
+  fs.writeFileSync(outputPath, css, 'utf-8');
+  console.log(`   ✅ CSS written (var refs preserved): ${outputPath}`);
+  console.log(`   Output: ${css.length.toLocaleString()} chars (same as input — no expansion)`);
+
+  // ─── F2: Write tokens.json with full cssVars map ───
+  if (tokensPath) {
+    let tokens = {};
+    if (fs.existsSync(tokensPath)) {
+      try { tokens = JSON.parse(fs.readFileSync(tokensPath, 'utf-8')); } catch {}
+    }
+    tokens.cssVars = mergedVars;
+    fs.writeFileSync(tokensPath, JSON.stringify(tokens, null, 2), 'utf-8');
+    console.log(`   ✅ Tokens updated: ${tokensPath}`);
+    console.log(`   Now inject-resolved-css.js will define :root { --token: value } block from these`);
+  }
+
+  // ─── F2: Also write tokens.css file (the :root block) for direct <link> use ───
+  const tokensCssPath = outputPath.replace(/\.css$/, '.tokens.css');
+  const tokensCss = `:root {\n${Object.entries(mergedVars).map(([k, v]) => `  ${k}: ${v};`).join('\n')}\n}\n`;
+  fs.writeFileSync(tokensCssPath, tokensCss, 'utf-8');
+  console.log(`   ✅ Tokens CSS (root block only): ${tokensCssPath}`);
+
+  // Count remaining var() refs (informational only — they're intentional now)
+  const remainingVarCount = (css.match(/var\(--[^,)]+/g) || []).length;
+  console.log(`   ℹ️  ${remainingVarCount} var() references preserved (will resolve at runtime via :root tokens)`);
   console.log('');
 }
 
