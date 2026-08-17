@@ -1,22 +1,25 @@
 ---
 name: clone-website
 description: |
-  Clone any website UI into a Next.js App Router project using a hybrid pipeline:
-  - Step 1: page_reader fetches HTML/CSS from URL
-  - Step 2: AI (LLM + cheerio) annotates data-component attributes
-  - Step 3: cheerio-based splitter (or html2react CLI for simple HTML) splits into .tsx skeletons (deterministic)
-  - Step 4: AI (LLM) converts CSS→Tailwind, adds state/logic, optimizes for Next.js
-  - Step 5: VLM visual QA compares original vs clone
+  Clone any website UI into a production-ready Next.js App Router project using a hybrid pipeline.
+  Full workflow: Crawl → Fetch → Resolve → Annotate → Split → Consolidate → Refine → Generate → Verify
+  
+  Phase 1 (CLONE): Extract HTML/CSS/components from any website
+  Phase 2 (BUILD APP): Consolidate shared components, AI refine CSS→Tailwind, generate Next.js routes
 
   Use this skill whenever the user wants to clone, replicate, rebuild, reverse-engineer,
-  or copy any website UI. Triggers on: "clone website", "copy this site", "rebuild this page",
+  or copy any website UI — AND convert it into a working Next.js app.
+  Triggers on: "clone website", "copy this site", "rebuild this page",
   "pixel-perfect clone", "webflow to nextjs", "html to react", "sao chép giao diện",
-  "clone giao diện", "tái tạo website". Provide the target URL as argument.
+  "clone giao diện", "tái tạo website", "build app from clone". Provide the target URL as argument.
 ---
 
-# Clone Website — Hybrid Pipeline (Deterministic CLI + AI Brain)
+# Clone Website → Build App — Full Pipeline
 
-You are a **website cloning agent** that reverse-engineers any website's UI into a production-ready Next.js App Router project. You use a **hybrid pipeline** where deterministic tools build the structural skeleton and AI handles the intelligent refinement.
+You are a **website cloning agent** that reverse-engineers any website's UI into a **production-ready Next.js App Router project**. The pipeline has two phases:
+
+**Phase 1 (CLONE)**: Deterministic tools extract HTML, CSS, components from the website
+**Phase 2 (BUILD APP)**: AI consolidates shared components, refines CSS→Tailwind, generates Next.js routes
 
 ## Why This Hybrid Approach Works
 
@@ -32,20 +35,33 @@ You are a **website cloning agent** that reverse-engineers any website's UI into
 ```
 URL
  │
- ├─ Step 0: CRAWL ───────── agent-browser ───→ Discover all pages (multi-page support)
+ ╔════════════════════════════════════════════════════════╗
+ ║  PHASE 1: CLONE — Extract website data                ║
+ ╠════════════════════════════════════════════════════════╣
+ ║                                                        ║
+ ║  Step 0: CRAWL ──────── agent-browser ──→ Discover pages║
+ ║  Step 1: FETCH ──────── agent-browser ──→ HTML+CSS+styles║
+ ║    └─ Step 1b: RESOLVE ─ resolve-css-vars → Actual values║
+ ║  Step 2: ANNOTATE ───── LLM+cheerio ────→ data-component ║
+ ║  Step 3: SPLIT ──────── cheerio ────────→ .tsx skeletons ║
+ ║    └─ Step 3b: CSS SPLIT → Per-component CSS            ║
+ ║                                                        ║
+ ╚════════════════════════════════════════════════════════╝
  │
- ├─ Step 1: FETCH ───────── agent-browser ───→ Rendered HTML + CSS + computed styles + assets
- │  │                        (page_reader fallback)
- │  ├─ Step 1b: RESOLVE ──── resolve-css-vars ─→ CSS variables → actual values
+ ╔════════════════════════════════════════════════════════╗
+ ║  PHASE 2: BUILD APP — Create Next.js project           ║
+ ╠════════════════════════════════════════════════════════╣
+ ║                                                        ║
+ ║  Step A: CONSOLIDATE ── Merge shared components         ║
+ ║          (Header, Footer across all pages → 1 version)  ║
+ ║  Step B: REFINE ─────── AI: CSS→Tailwind + React state ║
+ ║  Step C: GENERATE ───── Next.js App Router structure    ║
+ ║          (layout.tsx, page.tsx, dynamic [slug] routes)  ║
+ ║  Step D: COPY ASSETS ── Screenshots + design tokens     ║
+ ║                                                        ║
+ ╚════════════════════════════════════════════════════════╝
  │
- ├─ Step 2: ANNOTATE ───── LLM + cheerio ────→ HTML with data-component="..." attributes
- │
- ├─ Step 3: SPLIT ──────── cheerio/html2react ─→ .tsx skeleton components (full content, no truncation)
- │  ├─ Step 3b: CSS SPLIT ── split-css-by-comp ─→ Per-component CSS files + shared.css
- │
- ├─ Step 4: REFINE ─────── LLM (glm-4) ──────→ Tailwind CSS + Next.js logic + state
- │
- └─ Step 5: VERIFY ─────── VLM comparison ───→ Visual QA report + fixes
+ └─ Step 5: VERIFY ─────── VLM comparison ──→ Visual QA
 ```
 
 ## Prerequisites (Already Installed)
