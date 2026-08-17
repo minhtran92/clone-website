@@ -120,16 +120,30 @@ const mergedMap = new Map([...urlMap, ...fontUrlMap]);
 function rewriteContent(content) {
   let rewritten = content;
   let count = 0;
+  // Build augmented map with BOTH & and &amp; forms of each URL
+  // — JSX files have &amp; (HTML entity) in srcSet/src attributes,
+  // while manifest has plain & from URL parsing
+  const augmentedMap = new Map();
+  for (const [remoteUrl, localPath] of mergedMap.entries()) {
+    augmentedMap.set(remoteUrl, localPath);
+    if (remoteUrl.includes('&')) {
+      // Add HTML-entity-encoded version too
+      const entityUrl = remoteUrl.replace(/&/g, '&amp;');
+      if (entityUrl !== remoteUrl) {
+        augmentedMap.set(entityUrl, localPath);
+      }
+    }
+  }
   // Sort URLs by length desc to avoid partial replacement issues
   // (e.g. "https://example.com/img.jpg?w=100" should be matched before "https://example.com/img.jpg")
-  const sortedUrls = [...mergedMap.keys()].sort((a, b) => b.length - a.length);
+  const sortedUrls = [...augmentedMap.keys()].sort((a, b) => b.length - a.length);
   for (const remoteUrl of sortedUrls) {
     // Escape regex special chars in URL
     const escaped = remoteUrl.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     const re = new RegExp(escaped, 'g');
     const matches = rewritten.match(re);
     if (matches) {
-      rewritten = rewritten.replace(re, mergedMap.get(remoteUrl));
+      rewritten = rewritten.replace(re, augmentedMap.get(remoteUrl));
       count += matches.length;
     }
   }

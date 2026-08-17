@@ -82,6 +82,13 @@ const MAX_FILE_SIZE = 25 * 1024 * 1024;
 // === SSRF protection ===
 function isPrivateIp(ip) {
   if (!ip) return false;
+  // Node v24+ may pass an array (onlookupall) or an object — coerce to string
+  if (Array.isArray(ip)) {
+    return ip.some(addr => isPrivateIp(addr));
+  }
+  if (typeof ip !== 'string') {
+    ip = String(ip);
+  }
   // IPv4
   const m = ip.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
   if (m) {
@@ -139,9 +146,9 @@ function extractUrls(content) {
   for (const re of URL_PATTERNS) {
     let m;
     while ((m = re.exec(content)) !== null) {
-      const rawValue = m[1];
+      // Decode HTML entities (&amp; → &) — Framer's HTML contains these
+      const rawValue = m[1].replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'");
       // If this is a srcset value, split candidates and take the URL part of each candidate
-      // (srcset format: "url1 1x, url2 2x" or "url1 480w, url2 800w")
       const isSrcset = re.source.includes('srcset');
       const candidates = isSrcset
         ? rawValue.split(',').map(s => s.trim().split(/\s+/)[0]).filter(Boolean)
@@ -210,9 +217,10 @@ function saveGlobalUrlMap(outDir, map) {
 function hashToPath(hash, ext) {
   // Use first 2 chars as a sub-directory shard (like git objects)
   // to avoid 10k+ files in one flat directory
+  // NOTE: returns path RELATIVE to public/ (so the URL becomes "/assets/_hash/...")
+  // since outDir is typically "public/assets" and Next.js serves public/* at /*
   const prefix = hash.slice(0, 2);
-  const rest = hash.slice(2);
-  return path.join('_hash', prefix, `${hash}${ext}`);
+  return path.join('assets', '_hash', prefix, `${hash}${ext}`);
 }
 
 function getExtFromUrl(remoteUrl, contentType) {
@@ -252,34 +260,63 @@ function fetchWithRedirects(targetUrl, redirectsLeft = 5) {
       return reject(new Error(`Invalid URL: ${targetUrl}`));
     }
     const lib = parsed.protocol === 'https:' ? https : http;
-    // SSRF check: block private/loopback IPs unless --allow-private is set
     const hostname = parsed.hostname.toLowerCase();
-    if (!allowPrivate && !allowHosts.has(hostname)) {
-      // Resolve hostname and check IPs (covers both literal IPs and hostnames that resolve to private IPs)
-      // Synchronous DNS lookup is unavailable in pure Node without dns module; use dns.resolve
-      // For simplicity, check literal IPs here; DNS-level check is done at the socket-level via lookup
-      if (isPrivateIp(parsed.hostname)) {
-        return reject(new Error(`SSRF blocked: ${parsed.hostname} is a private/loopback IP. Use --allow-private to override.`));
-      }
+    if (!allowPrivate && !allowHosts.has(hostname) && isPrivateIp(parsed.hostname)) {
+      return reject(new Error(`SSRF blocked: ${parsed.hostname} is private/loopback. Use --allow-private to override.`));
     }
-    const req = lib.get(targetUrl, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (compatible; clone-website/1.0)',
-        'Accept': '*/*',
-      },
-      timeout: 30000,
-      lookup: allowPrivate ? undefined : (hostname, opts, cb) => {
-        // Custom DNS lookup that blocks private IPs
-        const dns = require('dns');
-        dns.lookup(hostname, opts, (err, address, family) => {
-          if (err) return cb(err);
-          if (isPrivateIp(address) && !allowHosts.has(hostname.toLowerCase())) {
-            return cb(new Error(`SSRF blocked: ${hostname} resolves to private IP ${address}. Use --allow-private to override.`));
-          }
-          cb(null, address, family);
-        });
-      },
-    }, (res) => {
+
+    // ─── SSRF protection via DNS pre-resolution ───────────────────────────
+    // Node v24's http.get `lookup` option has issues with callback signature.
+    // Instead, we pre-resolve the hostname, check if it's private,
+    // then connect to the IP directly with proper servername for TLS SNI.
+    if (allowPrivate || allowHosts.has(hostname)) {
+      // Skip DNS check — use default behavior
+      const req = lib.get(targetUrl, {
+        headers: { 'User-Agent': 'Mozilla/5.0 (compatible; clone-website/1.0)', 'Accept': '*/*' },
+        timeout: 30000,
+      }, handleResponse);
+      req.on('error', reject);
+      req.on('timeout', () => req.destroy(new Error('timeout')));
+      return;
+    }
+    const dns = require('dns');
+    dns.resolve4(parsed.hostname, (err, addresses) => {
+      if (err) {
+        // Fallback to default behavior (Node will use its own lookup)
+        const req = lib.get(targetUrl, {
+          headers: { 'User-Agent': 'Mozilla/5.0 (compatible; clone-website/1.0)', 'Accept': '*/*' },
+          timeout: 30000,
+        }, handleResponse);
+        req.on('error', reject);
+        req.on('timeout', () => req.destroy(new Error('timeout')));
+        return;
+      }
+      if (!addresses || addresses.length === 0) {
+        return reject(new Error(`No DNS records for ${parsed.hostname}`));
+      }
+      // Check all resolved IPs for SSRF
+      for (const addr of addresses) {
+        if (isPrivateIp(addr) && !allowHosts.has(hostname)) {
+          return reject(new Error(`SSRF blocked: ${hostname} resolves to private IP ${addr}. Use --allow-private to override.`));
+        }
+      }
+      // Connect to first IP with servername for TLS SNI
+      const req = lib.get({
+        host: addresses[0],
+        servername: parsed.hostname,
+        path: parsed.pathname + parsed.search,
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (compatible; clone-website/1.0)',
+          'Accept': '*/*',
+          'Host': parsed.hostname,
+        },
+        timeout: 30000,
+      }, handleResponse);
+      req.on('error', reject);
+      req.on('timeout', () => req.destroy(new Error('timeout')));
+    });
+
+    function handleResponse(res) {
       // Handle redirects
       if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location && redirectsLeft > 0) {
         const nextUrl = new URL(res.headers.location, targetUrl).href;
@@ -309,9 +346,7 @@ function fetchWithRedirects(targetUrl, redirectsLeft = 5) {
         chunks.push(c);
       });
       res.on('end', () => resolve({ buffer: Buffer.concat(chunks), contentType: res.headers['content-type'] || '' }));
-    });
-    req.on('error', reject);
-    req.on('timeout', () => req.destroy(new Error('timeout')));
+    }
   });
 }
 

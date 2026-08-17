@@ -178,11 +178,25 @@ function styleToJsx(styleStr) {
     }
 
     // Convert kebab-case → camelCase
-    const jsxProp = prop.replace(/-([a-z])/g, (_, c) => c.toUpperCase());
-    // Vendor prefix: -webkit-..., -moz-... → Webkit..., Moz...
-    const finalProp = jsxProp.replace(/^-([a-z])/, (_, c) => c.toUpperCase());
+    // BUT: CSS custom properties (--foo, --FramerTextColor) must be kept as-is
+    // (React allows string keys in style object for custom properties)
+    let finalProp;
+    if (prop.startsWith('--')) {
+      // CSS custom property — Framer uses --FramerTextColor (CamelCase) which is valid
+      // Keep as-is (wrap in quotes when used as object key)
+      finalProp = prop;
+    } else {
+      const jsxProp = prop.replace(/-([a-z])/g, (_, c) => c.toUpperCase());
+      // Vendor prefix: -webkit-..., -moz-... → Webkit..., Moz...
+      finalProp = jsxProp.replace(/^-([a-z])/, (_, c) => c.toUpperCase());
+    }
     // Escape quotes in val
     const escapedVal = val.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+    // For CSS custom properties, the key starts with --, which is invalid JS identifier
+    // → must be quoted: { '--FramerTextColor': 'value' }
+    if (finalProp.startsWith('--')) {
+      return `'${finalProp}': '${escapedVal}'`;
+    }
     return `${finalProp}: '${escapedVal}'`;
   }).filter(Boolean);
   return `{{ ${pairs.join(', ')} }}`;
@@ -237,6 +251,8 @@ function attrsToJsx(attrs) {
 
 function escapeAttrVal(val) {
   if (typeof val !== 'string') val = String(val);
+  // Decode common HTML entities first (Framer's HTML has &amp; in URLs)
+  val = val.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'");
   return val
     .replace(/&/g, '&amp;')
     .replace(/"/g, '&quot;')
@@ -314,29 +330,71 @@ function serializeNode(node, $, indent = 0, framerAppearIds = null) {
 }
 
 // === Extract HTML body from sanitized.html OR extract from skeleton .tsx ===
+// Returns { html, wrapperTag, wrapperAttrs }
+//   - html: the inner HTML to be ported
+//   - wrapperTag: outer tag name (e.g. 'section') if input is a .tsx skeleton
+//   - wrapperAttrs: outer tag attributes (className, style, etc.)
 function loadHtmlFromInput(inputPath) {
   const content = fs.readFileSync(inputPath, 'utf-8');
   // If input is .tsx skeleton, extract the inner HTML from dangerouslySetInnerHTML={{ __html: `...` }}
+  // AND preserve the OUTER wrapping element (the outermost JSX element in `return ( ... )`)
   if (inputPath.endsWith('.tsx') || inputPath.endsWith('.ts')) {
     // Match the template literal content
     const match = content.match(/dangerouslySetInnerHTML=\{\{[^`]*`([\s\S]*?)`\s*\}\}/);
     if (match) {
       // Unescape: \`, \\, \$
-      return match[1]
+      const innerHtml = match[1]
         .replace(/\\`/g, '`')
         .replace(/\\\\/g, '\\')
         .replace(/\\\$/g, '$')
         .replace(/\\\{/g, '{');
+
+      // Find the OUTER wrapping element (the outermost JSX element in `return ( ... )`)
+      // Pattern: return ( <TagName attr="..." ...>
+      // We want the FIRST opening tag after `return (`
+      const wrapperMatch = content.match(/return\s*\(\s*\n?\s*<(\w+)\s+([^>]*?)>/);
+      if (wrapperMatch) {
+        const wrapperTag = wrapperMatch[1].toLowerCase();
+        const wrapperAttrsStr = wrapperMatch[2] || '';
+        // Parse attrs into key="value" pairs (skip spread props {...})
+        const wrapperAttrs = {};
+        // Match attr="value" patterns (skip attrs that are inside {...} spreads)
+        const attrRe = /(\w+(?:-\w+)*)\s*=\s*"([^"]*)"/g;
+        let am;
+        while ((am = attrRe.exec(wrapperAttrsStr)) !== null) {
+          wrapperAttrs[am[1]] = am[2];
+        }
+        // Also catch style={{...}} patterns (not quoted with ")
+        const styleMatch = wrapperAttrsStr.match(/style\s*=\s*\{\{([^}]*)\}\}/);
+        if (styleMatch) {
+          // Convert JSX style object notation to CSS-style string for our parser
+          // e.g. "willChange: 'transform', opacity: '1'" → "will-change: transform; opacity: 1;"
+          const styleObj = styleMatch[1];
+          const cssDecls = [];
+          // Match key: 'value' pairs
+          const decls = styleObj.matchAll(/(\w+)\s*:\s*'([^']*)'/g);
+          for (const d of decls) {
+            // Convert camelCase to kebab-case
+            const kebab = d[1].replace(/([A-Z])/g, '-$1').toLowerCase();
+            cssDecls.push(`${kebab}: ${d[2]}`);
+          }
+          if (cssDecls.length > 0) {
+            wrapperAttrs['style'] = cssDecls.join('; ') + ';';
+          }
+        }
+        return { html: innerHtml, wrapperTag, wrapperAttrs };
+      }
+      return { html: innerHtml, wrapperTag: null, wrapperAttrs: {} };
     }
     // Fallback: maybe the file is already JSX (no dangerouslySetInnerHTML)
-    return content;
+    return { html: content, wrapperTag: null, wrapperAttrs: {} };
   }
   // .html file: return as-is (cheerio will parse)
-  return content;
+  return { html: content, wrapperTag: null, wrapperAttrs: {} };
 }
 
 // === Build complete Next.js component from JSX body ===
-function buildComponent(jsxBody, componentName, pageSlug, useCssModules, framerAppearIds) {
+function buildComponent(jsxBody, componentName, pageSlug, useCssModules, framerAppearIds, hasMultipleRoots = false) {
   // Detect if component needs 'use client' (Canvas, animations, Framer)
   const hasFramerAppear = framerAppearIds && framerAppearIds.size > 0;
   const needsClient =
@@ -391,8 +449,8 @@ import React from 'react';
 ${cssImport}${motionImport}
 ${motionVariants}
 export default function ${componentName}() {
-  return (
-${jsxBody.split('\n').map(l => '    ' + l).join('\n')}
+  return (${hasMultipleRoots ? '\n    <>' : ''}
+${jsxBody.split('\n').map(l => '    ' + l).join('\n')}${hasMultipleRoots ? '\n    </>' : ''}
   );
 }
 `;
@@ -482,7 +540,7 @@ Examples:
 
 function portSingle(inputPath, outputPath, componentName, pageSlug, useCssModules) {
   console.log(`📦 Loading: ${inputPath}`);
-  const html = loadHtmlFromInput(inputPath);
+  const { html, wrapperTag, wrapperAttrs } = loadHtmlFromInput(inputPath);
 
   // Use cheerio to parse (handles malformed HTML gracefully)
   const $ = cheerio.load(html, {
@@ -509,17 +567,41 @@ function portSingle(inputPath, outputPath, componentName, pageSlug, useCssModule
   console.log(`✂️  Serializing ${rootNodes.length} root nodes...`);
   // N8: Collect data-framer-appear-id values during serialization
   const framerAppearIds = new Set();
-  const jsxBody = rootNodes
+  let jsxBody = rootNodes
     .map(n => serializeNode(n, $, 2, framerAppearIds))
     .filter(Boolean)
     .join('\n');
 
+  // ─── Preserve wrapper tag from .tsx skeleton ───────────────────────
+  // When input was a .tsx skeleton like:
+  //   <section className="framer-16mosj6"><div dangerouslySetInnerHTML={...}/></section>
+  // We extracted the inner HTML but lost the <section> wrapper.
+  // Re-wrap the JSX body in the original wrapper tag.
+  let hasWrapper = false;
+  if (wrapperTag) {
+    const wrapperAttrsJsx = attrsToJsx(wrapperAttrs);
+    const wrapperAttrsLine = wrapperAttrsJsx ? ' ' + wrapperAttrsJsx : '';
+    const pad = '  ';
+    jsxBody = `${pad}<${wrapperTag}${wrapperAttrsLine}>\n${jsxBody}\n${pad}</${wrapperTag}>`;
+    hasWrapper = true;
+    console.log(`   📦 Wrapped in original <${wrapperTag}> from skeleton`);
+  }
+
+  // ─── Multiple roots → wrap in React Fragment ───────────────────────
+  // JSX requires a single root element. If we have multiple root nodes
+  // (e.g. <Header/> + <MainContent/> + <Footer/> at top level), wrap in <>...</>
+  // Skip this if we already wrapped in a wrapper tag (single root now)
+  const hasMultipleRoots = !hasWrapper && rootNodes.filter(n => n.type === 'tag' || n.type === 'text' && (n.data || '').trim()).length > 1;
+
   if (framerAppearIds.size > 0) {
     console.log(`   N8: Detected ${framerAppearIds.size} Framer appear-IDs (data-framer-appear-id preserved for motion wrapping)`);
   }
+  if (hasMultipleRoots) {
+    console.log(`   📦 Multiple root elements detected → wrapping in React Fragment`);
+  }
 
   console.log(`📝 Writing: ${outputPath}`);
-  const code = buildComponent(jsxBody, componentName, pageSlug, useCssModules, framerAppearIds);
+  const code = buildComponent(jsxBody, componentName, pageSlug, useCssModules, framerAppearIds, hasMultipleRoots);
   fs.writeFileSync(outputPath, code, 'utf-8');
 
   const lines = code.split('\n').length;

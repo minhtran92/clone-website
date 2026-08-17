@@ -59,6 +59,13 @@ const MAX_FILE_SIZE = 25 * 1024 * 1024; // 25 MB
 // SSRF protection
 function isPrivateIp(ip) {
   if (!ip) return false;
+  // Node v24+ may pass an array (onlookupall) or an object — coerce to string
+  if (Array.isArray(ip)) {
+    return ip.some(addr => isPrivateIp(addr));
+  }
+  if (typeof ip !== 'string') {
+    ip = String(ip);
+  }
   const m = ip.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
   if (m) {
     const [a, b] = [parseInt(m[1], 10), parseInt(m[2], 10)];
@@ -152,20 +159,56 @@ function fetchWithRedirects(targetUrl, redirectsLeft = 5) {
     if (!allowPrivate && !allowHosts.has(hostname) && isPrivateIp(parsed.hostname)) {
       return reject(new Error(`SSRF blocked: ${parsed.hostname} is private/loopback. Use --allow-private to override.`));
     }
-    const req = lib.get(targetUrl, {
-      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; clone-website/1.0)', 'Accept': '*/*' },
-      timeout: 30000,
-      lookup: allowPrivate ? undefined : (host, opts, cb) => {
-        const dns = require('dns');
-        dns.lookup(host, opts, (err, address, family) => {
-          if (err) return cb(err);
-          if (isPrivateIp(address) && !allowHosts.has(host.toLowerCase())) {
-            return cb(new Error(`SSRF blocked: ${host} resolves to private IP ${address}. Use --allow-private to override.`));
-          }
-          cb(null, address, family);
-        });
-      },
-    }, (res) => {
+
+    // ─── SSRF protection via DNS pre-resolution ───────────────────────────
+    // Node v24's http.get `lookup` option has issues with callback signature.
+    // Instead, we pre-resolve the hostname, check if it's private,
+    // then connect to the IP directly with proper servername for TLS SNI.
+    if (allowPrivate || allowHosts.has(hostname)) {
+      const req = lib.get(targetUrl, {
+        headers: { 'User-Agent': 'Mozilla/5.0 (compatible; clone-website/1.0)', 'Accept': '*/*' },
+        timeout: 30000,
+      }, handleResponse);
+      req.on('error', reject);
+      req.on('timeout', () => req.destroy(new Error('timeout')));
+      return;
+    }
+    const dns = require('dns');
+    dns.resolve4(parsed.hostname, (err, addresses) => {
+      if (err) {
+        // Fallback to default behavior
+        const req = lib.get(targetUrl, {
+          headers: { 'User-Agent': 'Mozilla/5.0 (compatible; clone-website/1.0)', 'Accept': '*/*' },
+          timeout: 30000,
+        }, handleResponse);
+        req.on('error', reject);
+        req.on('timeout', () => req.destroy(new Error('timeout')));
+        return;
+      }
+      if (!addresses || addresses.length === 0) {
+        return reject(new Error(`No DNS records for ${parsed.hostname}`));
+      }
+      for (const addr of addresses) {
+        if (isPrivateIp(addr) && !allowHosts.has(hostname)) {
+          return reject(new Error(`SSRF blocked: ${hostname} resolves to private IP ${addr}. Use --allow-private to override.`));
+        }
+      }
+      const req = lib.get({
+        host: addresses[0],
+        servername: parsed.hostname,
+        path: parsed.pathname + parsed.search,
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (compatible; clone-website/1.0)',
+          'Accept': '*/*',
+          'Host': parsed.hostname,
+        },
+        timeout: 30000,
+      }, handleResponse);
+      req.on('error', reject);
+      req.on('timeout', () => req.destroy(new Error('timeout')));
+    });
+
+    function handleResponse(res) {
       if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location && redirectsLeft > 0) {
         const nextUrl = new URL(res.headers.location, targetUrl).href;
         res.resume();
@@ -194,9 +237,7 @@ function fetchWithRedirects(targetUrl, redirectsLeft = 5) {
         chunks.push(c);
       });
       res.on('end', () => resolve(Buffer.concat(chunks)));
-    });
-    req.on('error', reject);
-    req.on('timeout', () => req.destroy(new Error('timeout')));
+    }
   });
 }
 
