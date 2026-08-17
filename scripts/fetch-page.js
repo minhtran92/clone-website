@@ -103,29 +103,39 @@ async function fetchWithAgentBrowser(url, outputDir) {
 
   const title = evalString('document.title') || 'Untitled';
 
-  // 3. Design tokens — extracted via small evals
-  console.log('3️⃣  Extracting design tokens (computed styles)...');
+  // 3. Design tokens — extracted via small evals (now with per-element styles + animations)
+  console.log('3️⃣  Extracting design tokens (computed styles + per-element + animations)...');
 
   const tokens = {};
 
-  // Colors
+  // Colors (expanded to 500 elements)
   tokens.colors = evalJson(
-    `[...new Set([...document.querySelectorAll('*')].slice(0,300).map(e=>{try{return getComputedStyle(e).color}catch{return''}}).filter(c=>c&&c!=='rgba(0, 0, 0, 0)'))].slice(0,50)`
+    `[...new Set([...document.querySelectorAll('*')].slice(0,500).map(e=>{try{return getComputedStyle(e).color}catch{return''}}).filter(c=>c&&c!=='rgba(0, 0, 0, 0)'))].slice(0,50)`
   ) || [];
 
   // Background colors
   tokens.bgColors = evalJson(
-    `[...new Set([...document.querySelectorAll('*')].slice(0,300).map(e=>{try{return getComputedStyle(e).backgroundColor}catch{return''}}).filter(c=>c&&c!=='rgba(0, 0, 0, 0)'&&c!=='transparent'))].slice(0,50)`
+    `[...new Set([...document.querySelectorAll('*')].slice(0,500).map(e=>{try{return getComputedStyle(e).backgroundColor}catch{return''}}).filter(c=>c&&c!=='rgba(0, 0, 0, 0)'&&c!=='transparent'))].slice(0,50)`
   ) || [];
 
   // Fonts
   tokens.fonts = evalJson(
-    `[...new Set([...document.querySelectorAll('*')].slice(0,200).map(e=>{try{return getComputedStyle(e).fontFamily}catch{return''}}).filter(Boolean))]`
+    `[...new Set([...document.querySelectorAll('*')].slice(0,500).map(e=>{try{return getComputedStyle(e).fontFamily}catch{return''}}).filter(Boolean))]`
   ) || [];
 
   // Font sizes
   tokens.fontSizes = evalJson(
-    `[...new Set([...document.querySelectorAll('*')].slice(0,200).map(e=>{try{return getComputedStyle(e).fontSize}catch{return''}}).filter(c=>c&&c!=='0px'))].sort()`
+    `[...new Set([...document.querySelectorAll('*')].slice(0,500).map(e=>{try{return getComputedStyle(e).fontSize}catch{return''}}).filter(c=>c&&c!=='0px'))].sort()`
+  ) || [];
+
+  // NEW: Font weights
+  tokens.fontWeights = evalJson(
+    `[...new Set([...document.querySelectorAll('*')].slice(0,500).map(e=>{try{return getComputedStyle(e).fontWeight}catch{return''}}).filter(Boolean))].sort()`
+  ) || [];
+
+  // NEW: Letter spacings
+  tokens.letterSpacings = evalJson(
+    `[...new Set([...document.querySelectorAll('*')].slice(0,500).map(e=>{try{return getComputedStyle(e).letterSpacing}catch{return''}}).filter(Boolean))].sort()`
   ) || [];
 
   // Element count
@@ -141,6 +151,22 @@ async function fetchWithAgentBrowser(url, outputDir) {
   tokens.images = evalJson(
     `[...document.querySelectorAll('img')].slice(0,50).map(i=>({src:i.src,alt:i.alt||'',w:i.naturalWidth,h:i.naturalHeight})).filter(i=>i.src)`
   ) || [];
+
+  // NEW: Per-element computed styles for important elements
+  console.log('3b️⃣  Extracting per-element computed styles...');
+  const elementStyles = evalJson(
+    `(function(){const els=document.querySelectorAll('h1,h2,h3,h4,h5,h6,p,a,button,nav,header,footer,section,img,[class*=hero],[class*=title],[class*=cta],[class*=btn],[class*=card],[class*=nav],[class*=logo],[class*=feature],[class*=price],[class*=testimonial],[class*=step],[class*=badge],[id]');const r=[];for(const el of els){try{const cs=getComputedStyle(el);const t=(el.textContent||'').trim().slice(0,150);r.push({tag:el.tagName.toLowerCase(),id:el.id||undefined,cls:(el.className||'').toString().slice(0,100)||undefined,text:t||undefined,style:{color:cs.color,backgroundColor:cs.backgroundColor!=='rgba(0,0,0,0)'&&cs.backgroundColor!=='transparent'?cs.backgroundColor:undefined,fontFamily:cs.fontFamily,fontSize:cs.fontSize,fontWeight:cs.fontWeight,letterSpacing:cs.letterSpacing,lineHeight:cs.lineHeight,textTransform:cs.textTransform,paddingTop:cs.paddingTop,paddingRight:cs.paddingRight,paddingBottom:cs.paddingBottom,paddingLeft:cs.paddingLeft,marginTop:cs.marginTop,marginBottom:cs.marginBottom,borderRadius:cs.borderRadius!=='0px'?cs.borderRadius:undefined,boxShadow:cs.boxShadow!=='none'?cs.boxShadow:undefined,display:cs.display,width:cs.width,height:cs.height,maxWidth:cs.maxWidth!=='none'?cs.maxWidth:undefined,gap:cs.gap!=='normal'&&cs.gap!=='0px'?cs.gap:undefined,backgroundImage:cs.backgroundImage!=='none'?cs.backgroundImage.slice(0,200):undefined,transition:cs.transition!=='all 0s ease 0s'?cs.transition.slice(0,200):undefined}})}catch(e){}}return r})()`
+  ) || [];
+  tokens.elementStyles = elementStyles;
+  console.log(`   Element styles: ${elementStyles.length} important elements`);
+
+  // NEW: Animation data
+  console.log('3c️⃣  Extracting animation data...');
+  const animations = evalJson(
+    `(function(){const r=[];try{for(const s of document.styleSheets){try{for(const rule of s.cssRules){if(rule.type===7&&rule.name){r.push({type:'keyframes',name:rule.name,css:rule.cssText.slice(0,1500)})}if(rule.style&&rule.style.transition&&rule.style.transition!=='all 0s ease 0s'&&rule.selectorText&&!rule.selectorText.match(/^framer/)){r.push({type:'transition',selector:rule.selectorText.slice(0,80),value:rule.style.transition.slice(0,200)})}if(rule.style&&rule.style.animation&&rule.selectorText){r.push({type:'animation-prop',selector:rule.selectorText.slice(0,80),value:rule.style.animation.slice(0,200)})}}}catch(e){}}}catch(e){}return r.slice(0,50)})()`
+  ) || [];
+  tokens.animations = animations;
+  console.log(`   Animations: ${animations.length} (keyframes + transitions)`);
 
   // CSS variables
   console.log('4️⃣  Extracting CSS variables...');
@@ -183,6 +209,8 @@ async function fetchWithAgentBrowser(url, outputDir) {
   }
 
   console.log(`   Colors: ${tokens.colors.length}, BG: ${tokens.bgColors.length}, Fonts: ${tokens.fonts.length}`);
+  console.log(`   Font weights: ${(tokens.fontWeights||[]).length}, Letter spacings: ${(tokens.letterSpacings||[]).length}`);
+  console.log(`   Element styles: ${(tokens.elementStyles||[]).length}, Animations: ${(tokens.animations||[]).length}`);
   console.log(`   CSS vars: ${Object.keys(tokens.cssVars).length}, Images: ${tokens.images.length}`);
   console.log(`   Inline CSS: ${allCss.length.toLocaleString()} chars, External sheets: ${tokens.stylesheets.length}`);
 
