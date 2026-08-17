@@ -165,15 +165,20 @@ function styleToJsx(styleStr) {
     let val = decl.slice(idx + 1).trim();
     if (!prop || !val) return null;
 
-    // ─── N6: Strip opacity:0 / transform:translateY(*) ──────────────────
+    // ─── N6: Strip opacity:0 / transform:translateY(*) ONLY when hidden ─
     // These are Framer SSR initial states for scroll-reveal animations.
     // Without Framer runtime, they'd hide content forever.
     // We strip them HERE (in addition to sanitize-html.js preflight) as defense-in-depth.
+    //
+    // IMPORTANT (bug fix): only strip transform:translateY(*) (vertical slide).
+    // Do NOT strip transform:translateX(*) — Framer uses translateX(-50%) for
+    // LAYOUT positioning (e.g. centering the sticky nav). Stripping it breaks
+    // the layout (nav shifts 300px right). Same logic as sanitize-html.js N6.
     if (/^opacity$/i.test(prop) && /^0(\.0+)?$/.test(val)) return null; // opacity:0 or opacity:0.0
-    if (/^transform$/i.test(prop) && /translate[XYZ]?\s*\(/i.test(val)) {
-      // If transform is ONLY a translate, drop it entirely
-      const cleaned = val.replace(/translate[XYZ]?\s*\([^)]*\)\s*/gi, '').trim();
-      if (!cleaned) return null; // entire transform was just a translate
+    if (/^transform$/i.test(prop) && /translateY\s*\(/i.test(val)) {
+      // Remove translateY(*) only (scroll-reveal vertical slide). Keep translateX(*).
+      const cleaned = val.replace(/translateY\s*\([^)]*\)\s*/gi, '').trim();
+      if (!cleaned) return null; // entire transform was just a translateY
       val = cleaned;
     }
 
@@ -403,9 +408,15 @@ function buildComponent(jsxBody, componentName, pageSlug, useCssModules, framerA
 
   const directive = needsClient ? "'use client';\n\n" : '';
 
-  // ─── N7: CSS Modules import ───────────────────────────────────────
+  // ─── Option 1: Per-component PLAIN CSS import ────────────────────
+  // Changed from CSS Modules (`import styles from './X.module.css'`) to a plain
+  // side-effect CSS import. Reason: CSS Modules hash class names, which breaks
+  // Framer's runtime JS that queries elements by literal class names (e.g.
+  // `.framer-16mosj6`). Plain CSS keeps selectors literal → fidelity 1:1 and
+  // animations keep working. The literal `className="framer-16mosj6"` in the
+  // JSX below is left untouched on purpose.
   const cssImport = useCssModules
-    ? `import styles from './${componentName}.module.css';\n`
+    ? `import './${componentName}.css';\n`
     : '';
 
   // ─── N8: Framer Motion import + variants ──────────────────────────

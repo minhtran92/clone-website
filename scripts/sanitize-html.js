@@ -148,29 +148,34 @@ function main() {
     removedCount++;
   });
 
-  // ─── N6-preflight: Strip opacity:0 / transform:translateY(*) inline styles ─
+  // ─── N6-preflight: Strip opacity:0 + transform:translateY(*) ONLY when hidden ─
   // Framer sets these initial states, then Framer runtime JS animates them to
   // opacity:1 + transform:none on scroll-trigger. Without Framer runtime, the
   // elements would be stuck invisible forever.
-  // We strip these HERE (during sanitize) so the HTML passed to port-html-to-jsx
-  // is already clean. port-html-to-jsx will then add proper Framer Motion wrappers.
-  const HIDDEN_PATTERN = /opacity:\s*0(?!\.\d*[1-9])/; // opacity:0 but not 0.5, 0.1 etc
-  const TRANSFORM_PATTERN = /transform:\s*translate[XYZ]?\s*\([^)]*\)/i;
+  //
+  // IMPORTANT (bug fix): only strip transform:translateY(*) (scroll-reveal hidden
+  // state). Do NOT strip transform:translateX(*) — Framer uses translateX(-50%)
+  // for LAYOUT positioning (e.g. centering the sticky nav). Stripping it breaks
+  // the layout (nav shifts 300px right).
+  //
+  // ALSO only strip when the element is actually hidden (opacity:0 or opacity:0.001).
+  // Elements with opacity:1 + transform:translateX(-50%) are already visible and
+  // the transform is layout-critical — leave it alone.
+  const HIDDEN_OPACITY = /opacity:\s*0(?:\.0+)?(?!\d)/; // opacity:0 / 0.0 / 0.00, not 0.5
+  // translateY (NOT translateX) — scroll-reveal hidden state slides vertically
+  const TRANSLATE_Y_PATTERN = /transform:\s*translateY\s*\([^)]*\)\s*;?/gi;
   $('*').each((_, el) => {
     const style = $(el).attr('style');
     if (!style) return;
     let newStyle = style;
     let changed = false;
-    // Remove opacity:0 (but keep opacity:0.5, opacity:0.1 etc)
-    if (HIDDEN_PATTERN.test(newStyle)) {
-      newStyle = newStyle.replace(/opacity:\s*0(?!\.\d*[1-9])\s*;?/g, '');
+    // Only strip transforms if the element is hidden (opacity:0)
+    if (HIDDEN_OPACITY.test(newStyle)) {
+      // Remove opacity:0
+      newStyle = newStyle.replace(/opacity:\s*0(?:\.0+)?(?!\d)\s*;?/gi, '');
       changed = true;
-    }
-    // Remove transform:translateY(*) / translateX(*) / translateZ(*)
-    // These are scroll-reveal initial states — without Framer runtime, they hide content
-    if (TRANSFORM_PATTERN.test(newStyle)) {
-      newStyle = newStyle.replace(/transform:\s*translate[XYZ]?\s*\([^)]*\)\s*;?/gi, '');
-      changed = true;
+      // Remove transform:translateY(*) only (NOT translateX — layout positioning)
+      newStyle = newStyle.replace(TRANSLATE_Y_PATTERN, '');
     }
     if (changed) {
       newStyle = newStyle.trim().replace(/;\s*$/, '');
@@ -183,7 +188,7 @@ function main() {
     }
   });
   if (fixedHiddenElements > 0) {
-    console.log(`   N6-preflight: Stripped opacity:0 + transform:translateY(*) inline styles from ${fixedHiddenElements} elements (would otherwise be hidden forever without Framer runtime)`);
+    console.log(`   N6-preflight: Stripped opacity:0 + transform:translateY(*) (hidden elements only — translateX(-50%) layout centering preserved) from ${fixedHiddenElements} elements`);
   }
 
   // 7. Remove framer-specific attributes that might cause issues

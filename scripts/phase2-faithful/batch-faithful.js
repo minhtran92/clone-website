@@ -8,8 +8,9 @@
  *   2. download-assets.js    → Tải ảnh remote (N4: global hash-based dedup)
  *   3. download-fonts.js     → Tải fonts (N4: global hash-based dedup)
  *   4. rewrite-asset-urls.js → Rewrite URL trong JSX
- *   5. split-css-modules.js  → F3+N7: Tách CSS thành .module.css per-component
- *   6. inject-resolved-css.js → F1+F2: Inject CSS vào globals (no scoping, var() preserved)
+ *   5. split-component-css.js → Option 1: per-component PLAIN .css + small globals
+ *                              (literal selectors → fidelity 1:1, animations keep working)
+ *   6. (REMOVED — inject-resolved-css.js gộp vào bước 5, không còn dump blob vào globals)
  *   7. generate-page.js      → F4+N9: Generate real React component tree in page.tsx
  *
  * Usage:
@@ -32,13 +33,13 @@ if (args.length < 3) {
   console.error(`Usage: node batch-faithful.js <clone-output> --src <dir> --public <dir> [--page <slug>] [--all] [--allow-private]
 
 Pipeline:
-  1. port-html-to-jsx.js   — PER-COMPONENT JSX (N5+N6+N8)
+  1. port-html-to-jsx.js    — PER-COMPONENT JSX (N5+N6+N8)
   2. download-assets.js     — Global hash dedup (N4)
-  3. download-fonts.js     — Global hash dedup (N4)
-  4. rewrite-asset-urls.js — Rewrite URLs in JSX
-  5. split-css-modules.js  — Per-component .module.css (F3+N7)
-  6. inject-resolved-css.js — No scoping + var() preserved (F1+F2)
-  7. generate-page.js      — Real React tree in page.tsx (F4+N9)
+  3. download-fonts.js      — Global hash dedup (N4)
+  4. rewrite-asset-urls.js  — Rewrite URLs in JSX
+  5. split-component-css.js — Option 1: per-component PLAIN .css + small globals
+  6. (REMOVED)              — was inject-resolved-css.js (merged into step 5)
+  7. generate-page.js       — Real React tree in page.tsx (F4+N9)
 
 Examples:
   node batch-faithful.js clone-output/pages/home --src src --public public --page home
@@ -103,6 +104,14 @@ function processPage(pageName, pageInputDir) {
       if (!runStep('1. Port HTML → JSX (PER-COMPONENT — N5+N6+N8)',
         path.join(SCRIPTS_DIR, 'port-html-to-jsx.js'),
         [componentsRawDir, jsxOutDir, '--page', pageName, '--css-modules'])) return false;
+      // Copy component-order.json (top-level vs nested manifest) from components-raw
+      // to the ported JSX dir, so generate-page.js (step 7) can render only top-level
+      // components and import nested CSS instead of duplicating content.
+      const orderManifest = path.join(componentsRawDir, 'component-order.json');
+      if (fs.existsSync(orderManifest)) {
+        fs.copyFileSync(orderManifest, path.join(jsxOutDir, 'component-order.json'));
+        console.log(`   📋 Copied component-order.json → ${jsxOutDir}`);
+      }
     } else {
       // Fall back to single-file port
       if (!runStep('1. Port HTML → JSX (single PageFaithful)',
@@ -149,34 +158,25 @@ function processPage(pageName, pageInputDir) {
     console.log('\n────────── 4. Rewrite asset URLs (skipped, no manifest) ──────────');
   }
 
-  // === Step 5: Split CSS into per-component .module.css (F3 + N7) ===
-  if (fs.existsSync(extractedCssPath) && fs.existsSync(componentsRawDir)) {
-    runStep('5. Split CSS into .module.css (F3+N7)',
-      path.join(SCRIPTS_DIR, 'split-css-modules.js'),
-      [extractedCssPath, componentsRawDir, jsxOutDir]);
-  } else if (fs.existsSync(extractedCssPath)) {
-    // No components-raw/ — split with just the ported JSX dir
-    runStep('5. Split CSS into .module.css (F3+N7)',
-      path.join(SCRIPTS_DIR, 'split-css-modules.js'),
-      [extractedCssPath, jsxOutDir, jsxOutDir]);
+  // === Step 5: Split CSS into per-component PLAIN .css + small globals (Option 1) ===
+  // Replaces old step 5 (split-css-modules.js) + step 6 (inject-resolved-css.js).
+  // Uses extracted.css as single CSS source (resolved.css is an identical verbatim
+  // copy per resolve-css-vars.js F2 — injecting both was a source of duplication/OOM).
+  // Global fragment (:root, @font-face, @keyframes, html/body/*) → src/app/globals.css
+  // Per-component CSS → src/components/pages/{page}/{Name}.css (literal selectors).
+  const globalsPath = path.join(srcDir, 'app', 'globals.css');
+  const splitComponentsDir = fs.existsSync(componentsRawDir) ? componentsRawDir : jsxOutDir;
+  if (fs.existsSync(extractedCssPath)) {
+    const splitArgs = [extractedCssPath, splitComponentsDir, jsxOutDir,
+      '--globals', globalsPath, '--page', pageName];
+    if (fs.existsSync(tokensJsonPath)) {
+      splitArgs.push('--tokens', tokensJsonPath);
+    }
+    runStep('5. Split CSS → per-component .css + small globals (Option 1)',
+      path.join(SCRIPTS_DIR, 'split-component-css.js'),
+      splitArgs);
   } else {
     console.log('\n────────── 5. Split CSS (skipped, no extracted.css) ──────────');
-  }
-
-  // === Step 6: Inject resolved CSS into globals.css (F1+F2) ===
-  const globalsPath = path.join(srcDir, 'app', 'globals.css');
-  if (fs.existsSync(resolvedCssPath)) {
-    const injectArgs = [resolvedCssPath];
-    if (fs.existsSync(extractedCssPath)) {
-      injectArgs.push('--extracted', extractedCssPath);
-    }
-    injectArgs.push('--globals', globalsPath, '--page', pageName);
-    if (fs.existsSync(tokensJsonPath)) {
-      injectArgs.push('--tokens', tokensJsonPath);
-    }
-    runStep('6. Inject resolved CSS (F1: no scope, F2: vars preserved)', path.join(SCRIPTS_DIR, 'inject-resolved-css.js'), injectArgs);
-  } else {
-    console.log('\n────────── 6. Inject resolved CSS (skipped, no resolved.css) ──────────');
   }
 
   // === Step 7: Generate page.tsx with real React component tree (F4+N9) ===
@@ -221,10 +221,10 @@ export default function Page() {
 
   console.log(`\n✅ Page "${pageName}" complete.`);
   console.log(`   - JSX components: ${jsxOutDir}/`);
-  console.log(`   - CSS modules: ${jsxOutDir}/*.module.css`);
+  console.log(`   - Per-component CSS: ${jsxOutDir}/*.css (plain, literal selectors → fidelity 1:1)`);
   console.log(`   - Assets: ${assetsOutDir}/ (global hash-based)`);
   console.log(`   - Fonts: ${fontsOutDir}/ (global hash-based)`);
-  console.log(`   - globals.css updated (F1: no scoping, F2: var() preserved)`);
+  console.log(`   - globals.css: small (:root vars, @keyframes, @font-face, html/body reset only)`);
   console.log(`   - page.tsx: ${pageOutputPath}`);
   console.log(`\n   NEXT: Run dev server and visit ${routePath === '/' ? '/' : routePath}`);
   return true;

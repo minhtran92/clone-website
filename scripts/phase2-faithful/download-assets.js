@@ -374,7 +374,11 @@ async function downloadOne(remoteUrl, outDir, pageSlug) {
     const hash = crypto.createHash('sha1').update(buffer).digest('hex');
     const ext = getExtFromUrl(remoteUrl, contentType);
     const globalRel = hashToPath(hash, ext);
-    const globalAbs = path.join(outDir, globalRel);
+    // hashToPath() returns "assets/_hash/..." (relative to public/, so the URL
+    // becomes "/assets/_hash/..."). But outDir is already "public/assets", so we
+    // must NOT prepend "assets/" again when computing the physical path — strip
+    // the leading "assets/" to avoid a doubled "public/assets/assets/_hash/...".
+    const globalAbs = path.join(outDir, globalRel.replace(/^assets[\\/]/, ''));
 
     if (fs.existsSync(globalAbs)) {
       // Hash collision (same content from different URL) — reuse existing file
